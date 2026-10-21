@@ -66,9 +66,10 @@ test: $(TESTS) $(EXAMPLES) symbols
 	  $(B)/examples/02_request $(EXMODEL) && $(B)/examples/03_steps $(EXMODEL) && $(B)/examples/04_edit $(EXMODEL); \
 	  else echo "examples: built, not run (no model in \$$SM_MODEL_DIR)"; fi
 symbols: $(B)/libsprongmotion.$(SO)
-	@if [ $(OS) = windows ]; then echo "exports: not checked on Windows"; exit 0; fi; $(EXPORTS) | sed 's/^_//' | sort > $(B)/exports.txt
-	@sed -n 's/^SM_API[^(]*[ *]\(sm_[a-z0-9_]*\)(.*/\1/p' include/sm.h | sort | diff - $(B)/exports.txt \
-	  && echo "exports: $$(grep -c . $(B)/exports.txt) symbols, as declared in sm.h"
+	@if [ $(OS) = windows ]; then echo "exports: not checked on Windows"; else \
+	  $(EXPORTS) | sed 's/^_//' | sort > $(B)/exports.txt && \
+	  sed -n 's/^SM_API[^(]*[ *]\(sm_[a-z0-9_]*\)(.*/\1/p' include/sm.h | sort | diff - $(B)/exports.txt && \
+	  echo "exports: $$(grep -c . $(B)/exports.txt) symbols, as declared in sm.h"; fi
 $(B)/bench: bench/bench.c include/sm.h $(B)/libsprongmotion.a
 	$(CC) $(WARN) $(CFLAGS) $< $(B)/libsprongmotion.a -o $@ -lm
 bench: $(B)/bench
