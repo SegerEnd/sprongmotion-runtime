@@ -24,7 +24,7 @@ enum { SIGMA = 20, RADIUS = 80 };   /* the facing smoothing: scipy gaussian_filt
 static void sub(const double *a, const double *b, double *o) { for (int k = 0; k < 3; k++) o[k] = a[k] - b[k]; }
 static double len3(const double *v) { return sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
 static void unit3(double *v) { const double n = len3(v); for (int k = 0; k < 3; k++) v[k] /= n; }
-static sm_quat conj(sm_quat q) { return (sm_quat){q.w, -q.x, -q.y, -q.z}; }
+static sm_quat qconj(sm_quat q) { return (sm_quat){q.w, -q.x, -q.y, -q.z}; }
 
 /* asin x = 2 atan(x / (1 + sqrt(1 - x^2))); atan halved twice to |z| <= tan(pi/16), then its series to z^25 (error
    < 1e-19): only + - * / and sqrt, the same bits on every target */
@@ -114,7 +114,7 @@ static void bone_rotations(const double *p, sm_quat root, float *rot6d) {
             double d[3];
             sub(p + 3 * b, p + 3 * a, d);
             unit3(d);
-            const sm_quat local = sm_qmul(conj(rot), sm_qbetween(raw[b], d));
+            const sm_quat local = sm_qmul(qconj(rot), sm_qbetween(raw[b], d));
             cont6d(local, rot6d + 6 * (b - 1));
             rot = sm_qmul(rot, local);
         }
@@ -136,7 +136,7 @@ void sm_joints_to_features(const float *joints, uint32_t T, double *tmp, float *
         double d[3], o[3];
         sub(n, p, d);
         sm_qrot(R[t + 1], d, o);
-        const sm_quat yv = sm_qmul(R[t + 1], conj(R[t]));
+        const sm_quat yv = sm_qmul(R[t + 1], qconj(R[t]));
         f[0] = (float)asin_(yv.y), f[1] = (float)o[0], f[2] = (float)o[2], f[3] = (float)p[1];
         for (int j = 1; j < SM_J; j++) {
             const double c[3] = {p[3 * j] - p[0], p[3 * j + 1], p[3 * j + 2] - p[2]};
