@@ -59,22 +59,29 @@ int main(void) {
         for (size_t i = 0; i < mn; i++) R[i] = frand();
         for (size_t i = 0; i < (size_t)N * K; i++) F[i] = frand();
         uint8_t *W = make_q8(N, K);
-        const sm_lin ls[] = {{W, b, SM_T_Q8_0, K, N}, {W, NULL, SM_T_Q8_0, K, N}, {F, b, SM_T_F32, K, N}};
-        for (size_t i = 0; i < 3; i++)
+        sm_lin ls[6] = {{W, b, SM_T_Q8_0, K, N, NULL}, {W, NULL, SM_T_Q8_0, K, N, NULL}, {F, b, SM_T_F32, K, N, NULL}};
+        float *P = malloc(sizeof(float) * 3 * N * K);   /* the same three packed at load */
+        for (size_t i = 0; i < 3; i++) ls[3 + i] = ls[i], sm_pack(&ls[3 + i], P + i * N * K);
+        for (size_t i = 0; i < 6; i++)
             for (sm_epi e = SM_EPI_NONE; e <= SM_EPI_ADD; e++) {
                 naive(&ls[i], X, M, A, e, R);
                 sm_linear(NULL, &ls[i], X, M, B, e, R);
                 CHECK(!memcmp(A, B, sizeof(float) * mn));
             }
-        free(X); free(b); free(A); free(B); free(R); free(F); free(W);
+        free(X); free(b); free(A); free(B); free(R); free(F); free(W); free(P);
     }
     const uint32_t M = 282, K = 384, N = 1536; int reps = 200;   /* speed: a CFG-stacked pass of the 14M FF layer */
     float *X = malloc(sizeof(float) * M * K), *Y = malloc(sizeof(float) * M * N); uint8_t *W = make_q8(N, K);
     for (size_t i = 0; i < (size_t)M * K; i++) X[i] = frand();
-    const sm_lin l = {W, NULL, SM_T_Q8_0, K, N};
-    const clock_t t0 = clock(); for (int r = 0; r < reps; r++) sm_linear(NULL, &l, X, M, Y, SM_EPI_NONE, NULL);
-    const double s = (double)(clock() - t0) / CLOCKS_PER_SEC;
-    printf("gemm q8 %ux%ux%u: %.1f GFLOP/s (1 thread)\n", M, K, N, 2.0 * M * K * N * reps / s / 1e9);
-    free(X); free(Y); free(W);
+    sm_lin l = {W, NULL, SM_T_Q8_0, K, N, NULL};
+    float *P = malloc(sizeof(float) * N * K);
+    for (int packed = 0; packed < 2; packed++) {
+        if (packed) sm_pack(&l, P);
+        const clock_t t0 = clock(); for (int r = 0; r < reps; r++) sm_linear(NULL, &l, X, M, Y, SM_EPI_NONE, NULL);
+        const double s = (double)(clock() - t0) / CLOCKS_PER_SEC;
+        printf("gemm q8%s %ux%ux%u: %.1f GFLOP/s (1 thread)\n", packed ? " packed" : "", M, K, N,
+               2.0 * M * K * N * reps / s / 1e9);
+    }
+    free(X); free(Y); free(W); free(P);
     return CHECK_DONE();
 }

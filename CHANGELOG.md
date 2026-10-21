@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.1 (2026-10-21)
+
+Faster, with the same output: codes, features and joints stay bit-identical to 1.0.0 on every exact build at any
+thread count.
+
+- The matrix weights are dequantised once at load into f32 panels instead of on every pass: about 6 % less time per
+  timeline block and 2 to 3 % per 10 s clip, native and WebAssembly. A model takes 57 MB more memory for it.
+- `docs/design.md` lists the faster options that would change the output, with their measured gains.
+
 ## 1.0.0 (2026-10-21)
 
 First release. Loads SprongMotion-14M 1.0 (`SprongMotion-14M-v1.0-Q8_0.gguf`, model file format 2).

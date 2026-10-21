@@ -98,12 +98,14 @@ static inline void sm_store4(float *p, v4 v) { memcpy(p, &v, 16); }
 static inline float sm_sum4(v4 v) { return (v[0] + v[1]) + (v[2] + v[3]); }
 
 /* matmul (sm_nn.c): Y[M][n] = X[M][k] W^T + b, then the epilogue. W rows: k floats (F32) or k/32 blocks of
-   {fp16 scale, 32 int8} (Q8_0). k % 32 == 0, n % 16 == 0. Bit-identical to the naive k-order loop of the same build. */
+   {fp16 scale, 32 int8} (Q8_0). k % 32 == 0, n % 16 == 0. Bit-identical to the naive k-order loop of the same build.
+   p: the weights dequantized at load as [n / 16][k][16] (NULL: dequantized a panel at a time) */
 #define SM_Q8_BLOCK 34
-typedef struct { const void *w; const float *b; uint32_t type, k, n; } sm_lin;
+typedef struct { const void *w; const float *b; uint32_t type, k, n; const float *p; } sm_lin;
 typedef enum { SM_EPI_NONE, SM_EPI_GELU, SM_EPI_ADD } sm_epi;   /* ADD: Y += add ([M][n], not Y itself) */
 float sm_half(uint16_t h);
 void  sm_row(const sm_lin *table, uint32_t i, float *out);   /* row i of a [n][k] table, dequantized */
+void  sm_pack(sm_lin *l, float *p);   /* p: k * n floats */
 void  sm_linear(const sm_par *par, const sm_lin *l, const float *X, uint32_t M, float *Y, sm_epi epi, const float *add);
 
 /* transformer layers (sm_nn.c). Rows are [M][d]; a pass holds several independent sequences (segments). */
@@ -180,7 +182,7 @@ float    sm_round_half(float x);   /* to the nearest float16 and back, ties to e
 struct sm_model {
     sm_hooks h; uint8_t *own; const void *map; size_t map_size;
     sm_gguf g; sm_tensor *tensors; sm_tok tok; void *tok_table; sm_vq vq; sm_textenc text; sm_gen gen;
-    sm_par par; void *pool;
+    sm_par par; void *pool; float *packed;
     const float *rest;   /* [22][3] the reference skeleton */
     double param[SM_N_PARAMS][3];   /* min, max, default */
     uint32_t fps, frames_per_token, max_frames, crc; int32_t params_k;

@@ -104,10 +104,24 @@ sm_status sm_bind_gen(sm_model *m, char *err, size_t en) {
     g->d = (uint32_t)dp[0], g->max_tokens = (uint32_t)dp[1];
     g->heads = g->d / 64 > 4 ? g->d / 64 : 4;
     g->word_dim = t->d;
-    if (!stack(m, g->mask.L, "trunk", g->d, &g->layers, err, en)) return SM_E_FORMAT;
-    memcpy(g->res.L, g->mask.L, sizeof g->res.L);
+    if (!stack(m, g->mask.L, "trunk", g->d, &g->layers, err, en) || !bind_heads(m, g, t->out.n, err, en))
+        return SM_E_FORMAT;
     t->par = g->par = &m->par;
-    return bind_heads(m, g, t->out.n, err, en) ? SM_OK : SM_E_FORMAT;
+    sm_lin *all[2 * 4 * SM_MAX_LAYERS + 16];
+    size_t n = 0, floats = 0;
+    for (uint32_t l = 0; l < t->layers; l++)
+        all[n++] = &t->L[l].qkv, all[n++] = &t->L[l].out, all[n++] = &t->L[l].ff1, all[n++] = &t->L[l].ff2;
+    for (uint32_t l = 0; l < g->layers; l++)
+        all[n++] = &g->mask.L[l].qkv, all[n++] = &g->mask.L[l].out, all[n++] = &g->mask.L[l].ff1, all[n++] = &g->mask.L[l].ff2;
+    sm_lin *heads[] = {&t->emb_up, &t->out, &g->mask.cond, &g->mask.word, &g->mask.dense, &g->mask.out, &g->res.cond,
+                       &g->res.dense};
+    for (size_t i = 0; i < sizeof heads / sizeof heads[0]; i++) all[n++] = heads[i];
+    for (uint32_t q = 1; q < SM_VQ_LAYERS; q++) all[n++] = &g->res_out[q];
+    for (size_t i = 0; i < n; i++) floats += (size_t)all[i]->k * all[i]->n;
+    if (!(m->packed = sm_alloc(&m->h, sizeof(float) * floats))) return sm_fail(err, en, SM_E_NOMEM, "out of memory");
+    for (size_t i = 0, at = 0; i < n; at += (size_t)all[i]->k * all[i]->n, i++) sm_pack(all[i], m->packed + at);
+    memcpy(g->res.L, g->mask.L, sizeof g->res.L);
+    return SM_OK;
 }
 
 /* text encoder: pre-norm layers, final LN, vec = out(concat(x[W-1], mean(x))) */

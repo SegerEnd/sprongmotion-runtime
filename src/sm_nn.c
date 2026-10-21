@@ -98,6 +98,11 @@ static void epilogue(const sm_lin *l, uint32_t M, uint32_t n0, float *Y, sm_epi 
     }
 }
 
+void sm_pack(sm_lin *l, float *p) {
+    for (uint32_t n0 = 0; n0 < l->n; n0 += NP) expand(l, n0, 0, l->k, p + (size_t)n0 * l->k);
+    l->p = p;
+}
+
 typedef struct { const sm_lin *l; const float *X; uint32_t M; float *Y; sm_epi epi; const float *add; } job;
 
 /* one task: output columns [16 i, 16 i + 16) of every row, all of K */
@@ -105,12 +110,13 @@ static void panel(void *arg, uint32_t i) {
     const job *j = arg;
     const sm_lin *l = j->l;
     const uint32_t K = l->k, N = l->n, M = j->M, n0 = i * NP;
-    float buf[KC * NP];
+    float tmp[KC * NP];
     for (uint32_t k0 = 0; k0 < K; k0 += KC) {
         const uint32_t kc = K - k0 < KC ? K - k0 : KC;
-        const float *b = l->b && k0 + kc == K ? l->b + n0 : NULL, *x = j->X + k0;
+        const float *b = l->b && k0 + kc == K ? l->b + n0 : NULL, *x = j->X + k0, *buf = tmp;
         float *y = j->Y + n0;
-        expand(l, n0, k0, kc, buf);
+        if (l->p) buf = l->p + (size_t)n0 * K + (size_t)k0 * NP;
+        else expand(l, n0, k0, kc, tmp);
         uint32_t m = 0;
         for (; m + TR <= M; m += TR) tile(TR, x + (size_t)m * K, K, buf, kc, y + (size_t)m * N, N, k0 > 0, b);
         for (; m < M; m++) tile(1, x + (size_t)m * K, K, buf, kc, y + (size_t)m * N, N, k0 > 0, b);

@@ -566,7 +566,7 @@ void sm_model_free(sm_model *m) {
     const void *map = m->map;
     const size_t map_size = m->map_size;
     sm_pool_free(&h, m->pool);
-    void *owned[] = {m->schema, m->meta_mem, m->vocab, m->tok_table, m->tok.remap, m->tensors, m->own, m};
+    void *owned[] = {m->packed, m->schema, m->meta_mem, m->vocab, m->tok_table, m->tok.remap, m->tensors, m->own, m};
     for (size_t i = 0; i < sizeof owned / sizeof owned[0]; i++) sm_free(&h, owned[i]);
     if (map) unmap(map, map_size);
 }

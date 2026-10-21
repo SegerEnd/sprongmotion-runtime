@@ -46,8 +46,9 @@ decoder and the text encoder are small. So the speed work is one matrix kernel.
 
 The model is a GGUF v3 file (https://github.com/ggml-org/ggml/blob/master/docs/gguf.md): little-endian, a key-value
 header, a tensor table and aligned data. The runtime has its own validating reader and does not link ggml. Matrices of
-64 x 64 or more are Q8_0 (32 int8 values with one fp16 scale), the rest F32. Q8_0 blocks are dequantised a panel at a
-time inside the matrix kernel, so the arithmetic is f32 (weights 8-bit, activations 32-bit).
+64 x 64 or more are Q8_0 (32 int8 values with one fp16 scale), the rest F32. At load the matrices of the matrix kernel
+are dequantised once into f32 panels of 16 columns (57 MB for SprongMotion-14M), so the arithmetic is f32 (weights
+8-bit in the file, activations 32-bit) and a pass reads its weights without converting them again.
 
 Keys the runtime reads:
 
@@ -111,13 +112,23 @@ the default 10 base steps and 5 residual layers, the exact build, best of 10 run
 
 | Threads | 2 s clip | 5 s clip | 10 s clip | one block in a 6 x 2 s timeline |
 |---|---|---|---|---|
-| 10 (the core count) | 73 ms | 122 ms | 228 ms | 78 ms |
-| 4 | 87 ms | 181 ms | 349 ms | 110 ms |
-| 1 | 331 ms | 650 ms | 1246 ms | 390 ms |
-| WebAssembly SIMD, 1 (node 26) | 319 ms | 705 ms | 1382 ms | |
+| 10 (the core count) | 56 ms | 115 ms | 220 ms | 70 ms |
+| 4 | 79 ms | 173 ms | 340 ms | 101 ms |
+| 1 | 280 ms | 620 ms | 1211 ms | 361 ms |
+| WebAssembly SIMD, 1 (node 26) | 319 ms | 707 ms | 1380 ms | 411 ms |
 
-A 2 s clip at 10 threads: text 0.3 ms, a base step 5.0 ms, a residual layer 4.2 ms, decoding 1.4 ms. `FAST=1` is about
+A 2 s clip at 10 threads: text 0.2 ms, a base step 3.8 ms, a residual layer 3.1 ms, decoding 1.4 ms. `FAST=1` is about
 1.7x faster in the matrix kernel.
+
+The exact matrix kernel runs at about 90 % of what one core can do without fused multiply-add, so faster than this
+means changing the output. Measured on the same machine (1.0.1):
+
+| Option | Gain |
+|---|---|
+| `FAST=1` (fused multiply-add) | 10 s clip 1211 -> 709 ms at 1 thread, 220 -> 171 ms at 10 |
+| int8 activations with int8 dot products (`sdot`) | the matrix kernel 4.3x on a 216 x 384 x 1536 product, a rough prototype |
+| 6 base steps instead of 10 | 10 s clip 248 -> 187 ms, a timeline block 78 -> 58 ms (10 threads) |
+| 3 residual layers instead of 5 | 10 s clip 248 -> 217 ms, a timeline block 78 -> 68 ms (10 threads) |
 
 ## API principles
 
