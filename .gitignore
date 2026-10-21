@@ -1,0 +1,6 @@
+build/
+__pycache__/
+*.pyc
+# reference tensors and the test model, not public
+tests/data/*.bin
+tests/data/*.gguf

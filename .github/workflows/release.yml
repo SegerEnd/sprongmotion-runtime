@@ -1,0 +1,92 @@
+# Builds and tests every platform, uploads the packages, and attaches them to a GitHub release on a v* tag.
+# The golden test data and model files are not in the repository: set the repository variable SM_TEST_DATA_URL to a
+# .tar.gz holding tests/data/ and models/ to run the full suite, otherwise only the tests that need no data run.
+name: release
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  SM_TEST_DATA_URL: ${{ vars.SM_TEST_DATA_URL }}
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, shell: bash, cc: cc }
+          - { os: ubuntu-24.04, shell: bash, cc: gcc }
+          - { os: windows-2022, shell: "msys2 {0}", cc: gcc }
+    runs-on: ${{ matrix.os }}
+    env:
+      CC: ${{ matrix.cc }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: make tar mingw-w64-x86_64-gcc
+      - name: test data
+        if: env.SM_TEST_DATA_URL != ''
+        run: curl -fsSL "$SM_TEST_DATA_URL" | tar -xz && echo "SM_MODEL_DIR=$PWD/models" >> "$GITHUB_ENV"
+      - name: build and test
+        run: |
+          if [ -d tests/data ]; then make test; else
+            make symbols build/test_gemm build/test_math && build/test_gemm && build/test_math; fi
+      - run: make dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: build/dist/*.tar.gz
+
+  wasm:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 4.0.10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: test data
+        if: env.SM_TEST_DATA_URL != ''
+        run: curl -fsSL "$SM_TEST_DATA_URL" | tar -xz && echo "SM_MODEL_DIR=$PWD/models" >> "$GITHUB_ENV"
+      - name: build and test
+        run: |
+          make wasm
+          if [ -d tests/data ]; then make wasm-test; else
+            make build/wasm/test_gemm.js build/wasm/test_math.js && node build/wasm/test_gemm.js && node build/wasm/test_math.js; fi
+      - run: make dist-wasm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-wasm
+          path: build/dist/*.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [native, wasm]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum *.tar.gz > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: CHANGELOG.md
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
