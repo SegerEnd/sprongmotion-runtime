@@ -27,10 +27,11 @@ MACHINE := $(shell $(CC) -dumpmachine)
 OS      = $(if $(findstring apple,$(MACHINE)),macos,$(if $(findstring mingw,$(MACHINE)),windows,linux))
 ARCH    = $(subst aarch64,arm64,$(firstword $(subst -, ,$(MACHINE))))
 SO      = $(if $(filter macos,$(OS)),dylib,$(if $(filter windows,$(OS)),dll,so))
+comma   = ,
 SHARED  = $(if $(filter macos,$(OS)),-dynamiclib -install_name @rpath/libsprongmotion.dylib -pthread,$(if \
-          $(filter windows,$(OS)),-shared -static-libgcc -Wl,--out-implib,$(B)/libsprongmotion.dll.a,-shared -pthread))
+          $(filter windows,$(OS)),-shared -static-libgcc -Wl$(comma)--out-implib$(comma)$(B)/libsprongmotion.dll.a,-shared -pthread))
 PIC     = $(if $(filter windows,$(OS)),,-fPIC)
-RPATH   = $(if $(filter windows,$(OS)),,-Wl,-rpath,$(abspath $(B)))
+RPATH   = $(if $(filter windows,$(OS)),,-Wl$(comma)-rpath$(comma)$(abspath $(B)))
 EXPORTS = $(if $(filter macos,$(OS)),nm -gU,nm -D --defined-only) $(B)/libsprongmotion.$(SO) | awk '{print $$3}'
 VERSION := $(shell awk '/define SM_VERSION_(MAJOR|MINOR|PATCH) /{v = v (v == "" ? "" : ".") $$3} END {print v}' include/sm.h)
 DIST    = sprongmotion-$(VERSION)-$(OS)-$(ARCH)
