@@ -1,8 +1,7 @@
-/* Parameters (one table), requests, text objects and the JSON schemas. */
+/* The parameter table, requests, text objects and the JSON schemas. */
 #include "sm_internal.h"
 
-/* id, name, int, unit, about, min, max, default, JSON separator. min and max are the runtime's limits (seconds: up to
-   the model's max_frames / fps); a model file may narrow them and set its own defaults (sprongmotion.defaults.*). */
+/* id, name, int, unit, about, min, max, default, JSON separator; a model file may narrow the range and set defaults */
 #define PARAMS(X)                                                                                                     \
     X(1, seconds, 0, "s", "clip length", 0.5, 10, 4, ",")                                                             \
     X(2, seed, 1, "", "same seed, same motion; variant i uses seed + i", 0, 2147483647, 0, ",")                       \
@@ -209,7 +208,8 @@ sm_status sm_check_text(const char *utf8, int32_t len, size_t *n, char *err, siz
     if (!utf8) return sm_fail(err, err_len, SM_E_ARG, "text is NULL");
     *n = len < 0 ? strlen(utf8) : (size_t)len;
     if (*n > SM_MAX_TEXT) return sm_fail_range(err, err_len, SM_E_ARG, "text bytes", (double)*n, 0, SM_MAX_TEXT);
-    return !memchr(utf8, 0, *n) && sm_utf8_valid(utf8, *n) ? SM_OK : sm_fail(err, err_len, SM_E_ARG, "text is not UTF-8");
+    if (memchr(utf8, 0, *n) || !sm_utf8_valid(utf8, *n)) return sm_fail(err, err_len, SM_E_ARG, "text is not UTF-8");
+    return SM_OK;
 }
 
 sm_status sm_request_set_text(sm_request *r, const char *utf8, int32_t len) {
@@ -311,7 +311,6 @@ sm_status sm_text_unknown_words(const sm_text *t, char *buf, size_t cap, size_t 
 }
 
 /* the API schema's layout, with the model's ranges and defaults */
-
 size_t sm_schema(const sm_model *m, char *buf, size_t cap) {
     sm_buf b = {buf, cap, 0};
     sm_puts(&b, "{\"version\":\"1.0.0\",\"fps\":");

@@ -1,4 +1,4 @@
-/* Quaternion algebra, features -> joints (vs tests/data/motion_golden.bin), joint rotations back onto the bones. */
+/* Quaternions, features to joints vs the reference, rotations back onto the bones. */
 #include "../src/sm_internal.h"
 #include "check.h"
 #include <stdlib.h>

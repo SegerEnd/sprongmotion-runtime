@@ -1,6 +1,4 @@
-/* Joint positions to the 263-d motion features the encoder reads: the training data's recipe (Guo et al.
-   2022, process_file): the clip on the target skeleton, on the floor, at the origin facing +Z, then root yaw velocity,
-   xz velocity and height, local joint positions, 6D joint rotations, joint velocities and foot contacts. */
+/* Joint positions to motion features, as the training data's process_file (Guo et al. 2022). */
 #include "sm_internal.h"
 
 static const double rest_direction[SM_J][3] = {
@@ -30,8 +28,7 @@ static double len3(const double *v) { return sqrt(v[0] * v[0] + v[1] * v[1] + v[
 static void unit3(double *v) { const double n = len3(v); for (int k = 0; k < 3; k++) v[k] /= n; }
 static sm_quat qconj(sm_quat q) { return (sm_quat){q.w, -q.x, -q.y, -q.z}; }
 
-/* asin x = 2 atan(x / (1 + sqrt(1 - x^2))); atan halved twice to |z| <= tan(pi/16), then its series to z^25 (error
-   < 1e-19): only + - * / and sqrt, the same bits on every target */
+/* asin x = 2 atan(x / (1 + sqrt(1 - x^2))), atan halved twice, then its series to z^25: + - * / and sqrt only */
 static double exact_asin(double x) {
     x = x > 1 ? 1 : x < -1 ? -1 : x;
     double z = x / (1 + sqrt(1 - x * x));
@@ -46,7 +43,8 @@ static double exact_asin(double x) {
 static void facing(const double *p, int sign, double *out) {
     double a[3];
     for (int k = 0; k < 3; k++)
-        a[k] = sign * (p[3 * SM_L_HIP + k] - p[3 * SM_R_HIP + k]) + (p[3 * SM_R_SHOULDER + k] - p[3 * SM_L_SHOULDER + k]);
+        a[k] = sign * (p[3 * SM_L_HIP + k] - p[3 * SM_R_HIP + k]) +
+               (p[3 * SM_R_SHOULDER + k] - p[3 * SM_L_SHOULDER + k]);
     unit3(a);
     out[0] = a[2];
     out[1] = 0;

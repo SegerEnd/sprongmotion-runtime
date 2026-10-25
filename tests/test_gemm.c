@@ -1,5 +1,4 @@
-/* The matrix multiply on Q8_0 and F32 weights: bit-identical to the naive loop on every shape the model uses
-   (and odd M), each epilogue, fp16 conversion exact, then the speed in GFLOP/s. */
+/* The matrix kernel: bit-identical to the naive loop on every shape the model uses, fp16 exact, and its speed. */
 #include "../src/sm_internal.h"
 #include "check.h"
 #include <stdlib.h>

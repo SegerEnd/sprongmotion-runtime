@@ -1,7 +1,4 @@
-/* Motion editing: features from joints and the VQ encoder vs torch (tests/data/enc_golden.bin), encode -> decode round
-   trips, pinned codes (in-painting, a locked block), loops and the timeline, with the seams' jerk and foot slide within
-   +-20 % of the inside of clips (the timeline gate in docs/design.md). Needs the model with the encoder,
-   $SM_MODEL_DIR/SprongMotion-14M-v1.0-Q8_0.gguf: without it only the features are tested. */
+/* Motion editing: the encoder vs torch, round trips, pinned codes, loops, timelines and their seams. */
 #include "../src/sm_internal.h"
 #include "check.h"
 #include <stdlib.h>

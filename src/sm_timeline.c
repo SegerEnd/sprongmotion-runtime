@@ -1,4 +1,4 @@
-/* Timelines: prompt blocks back to back, each made with its final neighbours' seams pinned, decoded in one pass. */
+/* Prompt blocks back to back, each made with its final neighbours' seams pinned, then decoded in one pass. */
 #include "sm_internal.h"
 #include <stdatomic.h>
 
@@ -45,11 +45,12 @@ static sm_status check_block(sm_ctx *c, const block *b, uint32_t i, uint32_t *to
     return block_fail(c, i, "no text, or enc not encoded or from another model");
 }
 
-/* every block valid, the timeline within one decode and each made block within one run; *L: the longest run */
+/* the timeline within one decode and each made block within one run; *L: the longest run */
 static sm_status check_blocks(sm_ctx *c, const sm_request *r, const block *b, uint32_t n, const sm_motion *out,
                               uint32_t *tok, uint32_t *L) {
     if (c->active) return sm_ctx_fail(c, SM_E_STATE, SM_ACTIVE);
-    if (!r || !out || r->m != c->m || out->m != c->m) return sm_ctx_fail(c, SM_E_ARG, "r or out NULL or from another model");
+    if (!r || !out || r->m != c->m || out->m != c->m)
+        return sm_ctx_fail(c, SM_E_ARG, "r or out NULL or from another model");
     if (atomic_load(&c->cancel)) return sm_ctx_fail(c, SM_E_CANCELLED, SM_CANCELLED_MSG);
     uint32_t total = 0;
     for (uint32_t i = 0; i < n; i++) {

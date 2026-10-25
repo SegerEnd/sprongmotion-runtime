@@ -1,8 +1,4 @@
-/* Root paths: point checks and messages, fuzzed points never crash, no path leaves the output unchanged (stored
-   hashes). With $SM_MODEL_DIR the warp: on the path within 2 cm, a timed point at its time, the clip's own path moves
-   it by at most 1 mm, warp off, decode-only edits, blocks, the step API, a prefix and a loop. With $SM_GATE_MODEL the
-   foot gate of docs/design.md (slide and jerk within +20 % of the unwarped clip) on a straight, a gentle S and a 4 m
-   circle walk. */
+/* Root paths: checks, fuzzing, unchanged output without one; with a model the warp, with $SM_GATE_MODEL the gate. */
 #include "../src/sm_internal.h"
 #include "check.h"
 #include <stdlib.h>

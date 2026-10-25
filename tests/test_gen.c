@@ -1,7 +1,4 @@
-/* The text encoder and the generator vs torch (tests/data/gen_golden.bin): the F32 file per pass, Q8_0 vs F32 token
-   agreement, sampled codes end to end, the hash noise, the same codes at any thread count, and the speed. Needs
-   $SM_GOLDEN_F32 and $SM_GOLDEN_Q8, the model files the golden data was made from: without them the generator tests
-   are skipped. */
+/* The text encoder and generator vs torch; needs $SM_GOLDEN_F32 and $SM_GOLDEN_Q8, else skipped. */
 #include "../src/sm_internal.h"
 #include "check.h"
 #include <stdlib.h>

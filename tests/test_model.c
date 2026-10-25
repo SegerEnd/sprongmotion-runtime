@@ -1,5 +1,4 @@
-/* The model file: load, tokenizer vs the reference (tests/data/tok_golden.bin), decoder through the loaded file vs
-   torch (tests/data/vq_golden.bin), corrupted files never crash, every byte allocated is freed, API misuse returns errors. */
+/* The model file: load, tokenizer and decoder vs the reference, damaged files, allocations, misuse. */
 #define _POSIX_C_SOURCE 200809L   /* posix_memalign */
 #include "../src/sm_internal.h"
 #include "check.h"

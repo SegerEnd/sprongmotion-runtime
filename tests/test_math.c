@@ -1,5 +1,4 @@
-/* Own exp and log against libm in double, float exp and erf in ulps against libm, float16 rounding against
-   the compiler's _Float16. */
+/* Own exp, log and erf against libm, float16 rounding against _Float16. */
 #include "../src/sm_internal.h"
 #include "check.h"
 #include <stdlib.h>

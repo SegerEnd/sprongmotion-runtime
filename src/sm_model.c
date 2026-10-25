@@ -1,4 +1,4 @@
-/* The model loader, which binds every tensor by name, type and shape, and the library basics. */
+/* The model loader, which checks every tensor's name, type and shape, and the library basics. */
 #define _POSIX_C_SOURCE 200809L   /* mmap, open */
 #include "sm_internal.h"
 #include <stdlib.h>
@@ -117,12 +117,14 @@ static sm_status find_tok_tables(sm_model *m, const int32_t **keep, uint32_t *n_
 }
 
 static sm_status check_tok_tables(const sm_tok *t, char *err, size_t err_len) {
-    if (t->sot != t->n_vocab - 2 || t->eot != t->n_vocab - 1) return sm_fail(err, err_len, SM_E_FORMAT, "bad tokenizer.sot");
+    if (t->sot != t->n_vocab - 2 || t->eot != t->n_vocab - 1)
+        return sm_fail(err, err_len, SM_E_FORMAT, "bad tokenizer.sot");
     for (uint32_t r = 0; r < 2 * t->n_merges; r++)   /* merge r may only use ids made before it */
         if (t->merges[r] < 0 || (uint32_t)t->merges[r] >= SM_TOK_BASE + r / 2)
             return sm_fail(err, err_len, SM_E_FORMAT, "bad tokenizer merge");
     for (int b = 0; b < SM_TOK_BYTES; b++)
-        if (t->byte_id[b] < 0 || t->byte_id[b] >= SM_TOK_BYTES) return sm_fail(err, err_len, SM_E_FORMAT, "bad tok.byte_id");
+        if (t->byte_id[b] < 0 || t->byte_id[b] >= SM_TOK_BYTES)
+            return sm_fail(err, err_len, SM_E_FORMAT, "bad tok.byte_id");
     for (uint32_t i = 0; i < t->n_ent; i++) {
         const int32_t *e = t->ent_index + 4 * i;
         const int bad_name = e[0] < 0 || e[1] < 1 || e[1] > 32 || (uint32_t)e[0] + (uint32_t)e[1] > t->n_ent_bytes;
@@ -149,7 +151,7 @@ static sm_status build_remap(sm_model *m, const int32_t *keep, uint32_t n_keep, 
     return SM_OK;
 }
 
-/* sm_model_vocab: the whole words, sorted, in one block with their pointers */
+/* the whole words, sorted, in one block with their pointers */
 static sm_status build_vocab(sm_model *m, char *err, size_t err_len) {
     uint32_t n;
     const size_t bytes = sm_tok_words(&m->tok, NULL, &n);
@@ -236,7 +238,8 @@ static sm_status bind_skeleton(sm_model *m, char *err, size_t err_len) {
         const float *o = m->rest + 3 * j;
         const double len = sqrt((double)o[0] * o[0] + (double)o[1] * o[1] + (double)o[2] * o[2]);
         const int fits = j ? len > MIN_BONE && len < MAX_BONE : len == 0;
-        if (parents[j] != sm_parent[j] || !fits) return sm_fail(err, err_len, SM_E_FORMAT, "the skeleton is not sprong-22");
+        if (parents[j] != sm_parent[j] || !fits)
+            return sm_fail(err, err_len, SM_E_FORMAT, "the skeleton is not sprong-22");
     }
     return SM_OK;
 }
@@ -246,8 +249,10 @@ static sm_status check_file(sm_model *m, uint32_t flags, char *err, size_t err_l
     uint32_t version = 0;
     if (!u32_of(g, "sprongmotion.format_version", &version))
         return sm_fail(err, err_len, SM_E_FORMAT, "no sprongmotion.format_version");
-    if (version != FORMAT_VERSION) return sm_fail(err, err_len, SM_E_VERSION, "model format version is newer than this runtime");
-    if (!u32_of(g, "sprongmotion.data_crc32", &m->crc)) return sm_fail(err, err_len, SM_E_FORMAT, "no sprongmotion.data_crc32");
+    if (version != FORMAT_VERSION)
+        return sm_fail(err, err_len, SM_E_VERSION, "model format version is newer than this runtime");
+    if (!u32_of(g, "sprongmotion.data_crc32", &m->crc))
+        return sm_fail(err, err_len, SM_E_FORMAT, "no sprongmotion.data_crc32");
     if (!(flags & SM_LOAD_NOCHECK) && sm_crc32(g->data, g->data_size) != m->crc)
         return sm_fail(err, err_len, SM_E_CHECKSUM, "model data checksum mismatch");
     return SM_OK;
@@ -260,14 +265,15 @@ static sm_status read_settings(sm_model *m, char *err, size_t err_len) {
         {"sprongmotion.tokenizer.sot", &m->tok.sot}, {"sprongmotion.tokenizer.eot", &m->tok.eot},
     };
     for (size_t i = 0; i < sizeof settings / sizeof settings[0]; i++)
-        if (!u32_of(&m->g, settings[i].key, settings[i].v)) return sm_fail(err, err_len, SM_E_FORMAT, "missing setting");
+        if (!u32_of(&m->g, settings[i].key, settings[i].v))
+            return sm_fail(err, err_len, SM_E_FORMAT, "missing setting");
     if (m->tok.max_len < 3 || m->tok.max_len > 64) return sm_fail(err, err_len, SM_E_FORMAT, "bad tokenizer.max_len");
     if (!m->fps || !m->frames_per_token || m->max_frames < m->frames_per_token)
         return sm_fail(err, err_len, SM_E_FORMAT, "bad frame settings");
     return SM_OK;
 }
 
-/* the string metadata, the id and the generator's size: everything but the tokenizer and the decoder */
+/* the string metadata, the id, and the generator's size: all but the tokenizer and the decoder */
 static sm_status describe(sm_model *m, char *err, size_t err_len) {
     const sm_gguf *g = &m->g;
     if (!(m->meta_mem = sm_alloc(&m->h, sm_gguf_strings(g, NULL, NULL, 0, &m->n_meta) + 1)))

@@ -1,10 +1,8 @@
-/* A strict GGUF v3 reader (https://github.com/ggml-org/ggml/blob/master/docs/gguf.md). The input is untrusted: every
-   read goes through take(), which stops at the end of the buffer. Beyond the spec: little endian, tensor types
-   F32 / I32 / Q8_0, unique tensor names, <= 4096 tensors and entries. */
+/* A strict GGUF v3 reader (ggml docs/gguf.md); every read goes through take(), which stops at the end. */
 #include "sm_internal.h"
 
 enum { GGUF_U32 = 4, GGUF_I32 = 5, GGUF_F32 = 6, GGUF_BOOL = 7, GGUF_STRING = 8, GGUF_ARRAY = 9, GGUF_N_TYPES = 13 };
-#define GGUF_VERSION  3
+#define GGUF_VERSION  3   /* beyond the spec: tensors F32, I32 or Q8_0, unique names, limits below */
 #define MAX_ENTRIES   4096
 #define MAX_STRING    65535
 #define MAX_ARRAY     (1u << 24)
@@ -163,7 +161,8 @@ static int32_t place_data(const reader *r, sm_gguf *g, uint32_t align, char *err
     return SM_OK;
 }
 
-int32_t sm_gguf_open(sm_gguf *g, const void *buf, size_t size, sm_tensor *t, uint64_t max_t, char *err, size_t err_len) {
+int32_t sm_gguf_open(sm_gguf *g, const void *buf, size_t size, sm_tensor *t, uint64_t max_t, char *err,
+                     size_t err_len) {
     reader r = {buf, (const uint8_t *)buf + size, 1};
     memset(g, 0, sizeof *g);
     g->base = buf;

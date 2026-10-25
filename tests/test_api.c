@@ -1,6 +1,4 @@
-/* The public API through the shared library only: misuse of every function, parameters and schema, decode,
-   rotations, BVH, foot lock, in place; with $SM_MODEL_DIR also generation, the step API, variants, text reuse, unknown
-   words, the vocabulary, zero allocation after reserve, cancel from another thread, and the seams of chained clips. */
+/* The public API through the shared library: misuse, parameters, decoding, BVH; with $SM_MODEL_DIR generation. */
 #define _POSIX_C_SOURCE 200809L   /* posix_memalign */
 #include "sm.h"
 #include "check.h"

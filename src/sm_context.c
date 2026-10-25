@@ -1,7 +1,8 @@
-/* Contexts: scratch memory, text encoding, generation one pass at a time, decoding into motions. */
+/* Contexts: scratch memory, text encoding, runs one pass at a time, decoding. */
 #include "sm_internal.h"
 #include <stdatomic.h>
 
+#define NO_RUN "no run: call sm_ctx_begin"
 #define FADE 8   /* frames over which a prefix clip's end fades into the new one */
 
 sm_status sm_ctx_fail(sm_ctx *c, sm_status s, const char *msg) { return sm_fail(c->err, sizeof c->err, s, msg); }
@@ -61,8 +62,10 @@ uint32_t sm_tokens_of(const sm_model *m, double seconds) {
 sm_status sm_ctx_reserve(sm_ctx *c, double max_seconds, uint32_t max_variants) {
     if (no_ctx(c)) return SM_E_ARG;
     const double *sec = c->m->param[SM_P_SECONDS];
-    if (!(max_seconds >= sec[0] && max_seconds <= sec[1])) return sm_ctx_fail_range(c, "max_seconds", max_seconds, sec[0], sec[1]);
-    if (!max_variants || max_variants > SM_MAX_VARIANTS) return sm_ctx_fail_range(c, "max_variants", max_variants, 1, SM_MAX_VARIANTS);
+    if (!(max_seconds >= sec[0] && max_seconds <= sec[1]))
+        return sm_ctx_fail_range(c, "max_seconds", max_seconds, sec[0], sec[1]);
+    if (!max_variants || max_variants > SM_MAX_VARIANTS)
+        return sm_ctx_fail_range(c, "max_variants", max_variants, 1, SM_MAX_VARIANTS);
     const uint32_t most = c->m->max_frames / c->m->frames_per_token, L = sm_tokens_of(c->m, max_seconds);
     return sm_ctx_fit(c, L + SM_TIE < most ? L + SM_TIE : most, L + 2 * SM_WRAP);
 }
@@ -144,7 +147,7 @@ sm_status sm_ctx_decode(sm_ctx *c, const int16_t *codes, uint32_t n, const sm_pr
         const float *seen = feat + (2 * (size_t)K - 1) * SM_F;
         fade_from_prefix(mo, pre, seen);
         track = pre->track;
-        memcpy(track.vel, seen, sizeof track.vel);   /* the step into the first frame: prev's own end velocity is poor */
+        memcpy(track.vel, seen, sizeof track.vel);   /* into the first frame: prev's own end velocity is poor */
     }
     sm_motion_post(mo, &track, v, path, tmp);
     return SM_OK;
@@ -201,7 +204,8 @@ sm_status sm_ctx_encode_motion(sm_ctx *c, const sm_request *r, const float *join
     float *feat = (float *)(void *)((char *)c->dec + tmp);
     sm_joints_to_features(joints, n_frames, c->dec, feat);
     for (size_t i = 0; i < (size_t)T * SM_F; i++)
-        if (!isfinite(feat[i])) return sm_ctx_fail(c, SM_E_NUMERIC, "the joints have no pose to read (zero-length bones?)");
+        if (!isfinite(feat[i]))
+            return sm_ctx_fail(c, SM_E_NUMERIC, "the joints have no pose to read (zero-length bones?)");
     sm_vq_encode(&c->m->vq, feat, T, out->codes, feat + (size_t)T * SM_F);
     return decode_plain(c, r, out->codes, L, out);
 }
@@ -246,7 +250,8 @@ static sm_status check_run(sm_ctx *c, const sm_request *r, sm_motion *const *out
     if (!r || !outs || r->m != c->m) return sm_ctx_fail(c, SM_E_ARG, "r or outs NULL, or r from another model");
     if (!n || n > SM_MAX_VARIANTS) return sm_ctx_fail_range(c, "n_variants", n, 1, SM_MAX_VARIANTS);
     for (uint32_t i = 0; i < n; i++)
-        if (!outs[i] || outs[i]->m != c->m) return sm_ctx_fail(c, SM_E_ARG, "an output motion is NULL or from another model");
+        if (!outs[i] || outs[i]->m != c->m)
+            return sm_ctx_fail(c, SM_E_ARG, "an output motion is NULL or from another model");
     if (!c->m->gen.layers) return sm_ctx_fail(c, SM_E_UNSUPPORTED, "this model file has no generator");
     if (!r->has_text) return sm_ctx_fail(c, SM_E_ARG, "no text: call sm_request_set_text");
     if (atomic_load(&c->cancel)) return sm_ctx_fail(c, SM_E_CANCELLED, SM_CANCELLED_MSG);
@@ -258,7 +263,8 @@ static sm_status check_run(sm_ctx *c, const sm_request *r, sm_motion *const *out
     const double lo = c->m->param[SM_P_SECONDS][0];
     const double hi = (double)(cap - (L - fresh)) * c->m->frames_per_token / c->m->fps;
     if (L > cap)
-        return sm_ctx_fail_range(c, skip ? "seconds with a prefix" : loop ? "seconds of a loop" : "seconds", r->v[SM_P_SECONDS],
+        return sm_ctx_fail_range(c, skip ? "seconds with a prefix" : loop ? "seconds of a loop" : "seconds",
+                                 r->v[SM_P_SECONDS],
                       lo, hi);
     if (r->n_pins > fresh) return sm_ctx_fail_range(c, "pinned tokens", r->n_pins, 0, fresh);
     const sm_status s = sm_path_check(c->m, &r->path, fresh, c->err, sizeof c->err);
@@ -313,7 +319,7 @@ sm_status sm_ctx_begin(sm_ctx *c, const sm_request *r, sm_motion *const *outs, u
 sm_status sm_ctx_step(sm_ctx *c, uint32_t *done, uint32_t *total) {
     if (no_ctx(c)) return SM_E_ARG;
     if (!c->active || c->at == c->n)
-        return sm_ctx_fail(c, SM_E_STATE, c->active ? "the run is done: call sm_ctx_finish" : "no run: call sm_ctx_begin");
+        return sm_ctx_fail(c, SM_E_STATE, c->active ? "the run is done: call sm_ctx_finish" : NO_RUN);
     sm_status s = sm_ctx_next_pass(c);
     if (s == SM_DONE) {
         emit(c, c->at);
@@ -333,7 +339,7 @@ sm_status sm_ctx_step(sm_ctx *c, uint32_t *done, uint32_t *total) {
 
 sm_status sm_ctx_preview(sm_ctx *c) {
     if (no_ctx(c)) return SM_E_ARG;
-    if (!c->active) return sm_ctx_fail(c, SM_E_STATE, "no run: call sm_ctx_begin");
+    if (!c->active) return sm_ctx_fail(c, SM_E_STATE, NO_RUN);
     if (c->at < c->n && c->run.pass) emit(c, c->at);
     sm_status s = SM_OK;
     for (uint32_t i = 0; s == SM_OK && i < c->n; i++)
@@ -343,7 +349,8 @@ sm_status sm_ctx_preview(sm_ctx *c) {
 
 sm_status sm_ctx_finish(sm_ctx *c) {
     if (no_ctx(c)) return SM_E_ARG;
-    if (!c->active || c->at < c->n) return sm_ctx_fail(c, SM_E_STATE, "the run is not done: call sm_ctx_step until SM_DONE");
+    if (!c->active || c->at < c->n)
+        return sm_ctx_fail(c, SM_E_STATE, "the run is not done: call sm_ctx_step until SM_DONE");
     sm_status s = SM_OK;
     for (uint32_t i = 0; s == SM_OK && i < c->n; i++)
         s = sm_ctx_decode(c, c->outs[i]->codes, c->fresh, &c->pre, c->v, &c->path, c->outs[i]);

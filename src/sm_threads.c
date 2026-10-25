@@ -1,5 +1,4 @@
-/* The built-in thread pool behind sm_hooks.parallel_for. Tasks write disjoint outputs, so the result
-   does not depend on which thread runs which task. */
+/* The built-in thread pool. Tasks write disjoint outputs, so which thread runs which does not change the result. */
 #define _DEFAULT_SOURCE   /* sysconf on glibc with -std=c11 */
 #include "sm_internal.h"
 
@@ -57,8 +56,8 @@ static void yield(void) { sched_yield(); }
 #define YIELDS 1000   /* a yield lets the host's threads run in the gaps, so they preempt no worker during an op */
 #define MAX_THREADS 64
 
-/* claim = n << 32 | the next task. A claim only succeeds on the current run's word, so a worker late from an earlier
-   run takes nothing or a task of this one, and the caller waits for the tasks, not for workers that took none. */
+/* claim = n << 32 | the next task. A worker late from an earlier run claims on this run's word, so it takes nothing
+   or a task of this one, and the caller waits for the tasks, not for the workers */
 typedef struct {
     lock_t lock;
     cond_t wake;
@@ -111,7 +110,7 @@ static DWORD WINAPI entry(LPVOID p) { worker(p); return 0; }
 static void *entry(void *p) { worker(p); return NULL; }
 #endif
 
-/* a sleeper counts itself before it reads the generation, which is bumped before sleepers is read: one sees the other */
+/* a sleeper counts itself before it reads the generation, bumped here before sleepers is read: one sees the other */
 static void wake_workers(pool *p) {
     atomic_fetch_add(&p->generation, 1);
     if (!atomic_load(&p->sleepers)) return;

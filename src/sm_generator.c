@@ -1,5 +1,4 @@
-/* The text encoder and the token generator: a masked base model and a residual model on one post-norm
-   trunk, both with classifier-free guidance, and the sampling loop (MoMask, Guo et al. 2024). */
+/* The text encoder and the generator: masked and residual heads on one trunk (MoMask, Guo et al. 2024). */
 #include "sm_internal.h"
 
 enum { N_CODES = 512, MASK_ID = 512, RES_N = 513 };   /* RES_N: the codes and the pad code */
@@ -19,7 +18,8 @@ static const float *vec(const sm_model *m, const char *name, uint64_t n, char *e
 static uint32_t head_count(uint32_t d) { return d / 64 > 4 ? d / 64 : 4; }
 
 /* [n][k] rows, Q8_0 or F32 (k or n 0: any); a MATRIX_BIAS is name.w and name.b */
-static int lin(const sm_model *m, sm_lin *l, const char *name, int kind, uint64_t k, uint64_t n, char *err, size_t err_len) {
+static int lin(const sm_model *m, sm_lin *l, const char *name, int kind, uint64_t k, uint64_t n, char *err,
+               size_t err_len) {
     char weight[64], bias[64];
     uint64_t dims[2] = {k, n};
     snprintf(weight, sizeof weight, kind == MATRIX_BIAS ? "%s.w" : "%s", name);
@@ -53,9 +53,10 @@ static int bind_layer(const sm_model *m, sm_layer *l, const char *prefix, uint32
     char name[6][48];
     for (int i = 0; i < 6; i++) snprintf(name[i], sizeof name[i], "%s.%s", prefix, part[i]);
     return lin(m, &l->qkv, name[0], MATRIX_BIAS, d, 3 * d, err, err_len) &&
-           lin(m, &l->out, name[1], MATRIX_BIAS, d, d, err, err_len) && lin(m, &l->ff1, name[2], MATRIX_BIAS, d, 0, err, err_len) &&
-           lin(m, &l->ff2, name[3], MATRIX_BIAS, l->ff1.n, d, err, err_len) && norm(m, &l->ln1, name[4], d, err, err_len) &&
-           norm(m, &l->ln2, name[5], d, err, err_len);
+           lin(m, &l->out, name[1], MATRIX_BIAS, d, d, err, err_len) &&
+           lin(m, &l->ff1, name[2], MATRIX_BIAS, d, 0, err, err_len) &&
+           lin(m, &l->ff2, name[3], MATRIX_BIAS, l->ff1.n, d, err, err_len) &&
+           norm(m, &l->ln1, name[4], d, err, err_len) && norm(m, &l->ln2, name[5], d, err, err_len);
 }
 
 /* layers by probing prefix.L0, prefix.L1, ... */
@@ -107,8 +108,10 @@ static int bind_heads(const sm_model *m, sm_gen *g, uint32_t text_dim, char *err
     const uint32_t d = g->d;
     uint64_t quant_dims[2] = {SM_VQ_LAYERS, d};
     const struct { sm_lin *l; const char *name; int kind; uint32_t k, n; } lins[] = {
-        {&g->mask.cond, "mask.cond", MATRIX_BIAS, text_dim, d}, {&g->mask.word, "mask.word", MATRIX_BIAS, g->word_dim, d},
-        {&g->mask.dense, "mask.head.dense", MATRIX_BIAS, d, d}, {&g->mask.out, "mask.head.out", MATRIX_BIAS, d, N_CODES},
+        {&g->mask.cond, "mask.cond", MATRIX_BIAS, text_dim, d},
+        {&g->mask.word, "mask.word", MATRIX_BIAS, g->word_dim, d},
+        {&g->mask.dense, "mask.head.dense", MATRIX_BIAS, d, d},
+        {&g->mask.out, "mask.head.out", MATRIX_BIAS, d, N_CODES},
         {&g->tok, "mask.tok", TABLE, d, 0}, {&g->res.cond, "res.cond", MATRIX_BIAS, text_dim, d},
         {&g->res.dense, "res.head.dense", MATRIX_BIAS, d, d},
     };
@@ -148,7 +151,8 @@ static sm_status pack_weights(sm_model *m, char *err, size_t err_len) {
 
     size_t floats = 0;
     for (size_t i = 0; i < n; i++) floats += (size_t)all[i]->k * all[i]->n;
-    if (!(m->packed = sm_alloc(&m->h, sizeof(float) * floats))) return sm_fail(err, err_len, SM_E_NOMEM, "out of memory");
+    if (!(m->packed = sm_alloc(&m->h, sizeof(float) * floats)))
+        return sm_fail(err, err_len, SM_E_NOMEM, "out of memory");
     float *at = m->packed;
     for (size_t i = 0; i < n; i++) {
         sm_pack(all[i], at);
@@ -180,7 +184,7 @@ sm_status sm_bind_gen(sm_model *m, char *err, size_t err_len) {
     return s;
 }
 
-/* text encoder: pre-norm layers, final LN, vec = out(concat(x[W-1], mean(x))) */
+/* pre-norm layers, final LN, vec = out(concat(x[W-1], mean(x))) */
 size_t sm_text_scratch_floats(const sm_textenc *t) {
     const size_t M = t->max_len;
     return M * t->emb.k + M * t->d + 2 * (size_t)t->d +

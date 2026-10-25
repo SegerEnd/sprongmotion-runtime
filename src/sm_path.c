@@ -1,5 +1,4 @@
-/* A root path: its points, a centripetal Catmull-Rom curve walked by arc length, and the warp of a motion's
-   root onto it (Gleicher 2001). */
+/* Root paths: a centripetal Catmull-Rom curve walked by arc length, and the root warped onto it (Gleicher 2001). */
 #include "sm_internal.h"
 
 #define PI     3.14159265358979323846
@@ -103,8 +102,8 @@ static double dist(const double a[2], const double b[2]) {
     return sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]));
 }
 
-/* segment s at u in 0..1: position and derivative. Knots t_k+1 = t_k + |P_k+1 - P_k|^0.5 (centripetal: no cusps or
-   self-intersections, Yuksel et al. 2011), as a cubic Hermite with the Catmull-Rom tangents of that parametrisation */
+/* segment s at u in 0..1: position and derivative, knots t_k+1 = t_k + |P_k+1 - P_k|^0.5 (centripetal: no cusps or
+   self-intersections, Yuksel et al. 2011) */
 static void eval(const curve *c, uint32_t s, double u, double p[2], double d[2]) {
     double P[4][2], t[4] = {0};
     for (int k = 0; k < 4; k++) point(c, (int64_t)s + k - 1, P[k]);
@@ -255,8 +254,8 @@ static void move_frame(float *frame, const double g[2], const double P[2], doubl
     }
 }
 
-double sm_path_warp(const sm_path *p, float *joints, uint32_t T, double fps, const double *g, int warp, double *yaw_added,
-                    double *tmp) {
+double sm_path_warp(const sm_path *p, float *joints, uint32_t T, double fps, const double *g, int warp,
+                    double *yaw_added, double *tmp) {
     double *psi = tmp, *u = psi + T, *px = u + T, *pz = px + SM_MAX_PATH, *arc = pz + SM_MAX_PATH;
     double *kx = arc + SM_MAX_PATH, *ky = kx + SM_MAX_PATH + 2, *km = ky + SM_MAX_PATH + 2;
     uint32_t index[SM_MAX_PATH];

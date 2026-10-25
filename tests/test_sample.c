@@ -1,6 +1,4 @@
-/* The C sampler vs the reference sampler on the same logits and noise (tests/data/sample_golden.bin): the masked ids
-   the model sees at every step and the final codes must be identical, ties included. Also the schedule against
-   Python's numbers. */
+/* The sampler vs the reference on the same logits and noise, ties included, and the mask schedule. */
 #include "../src/sm_internal.h"
 #include "check.h"
 #include <stdlib.h>

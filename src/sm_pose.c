@@ -1,4 +1,4 @@
-/* Poses: quaternions, features to joints, joint rotations, the clip's skeleton, foot contacts and foot locking. */
+/* Features to joints, joint rotations, the clip's skeleton, foot contacts and foot lock. */
 #include "sm_internal.h"
 #include <stdlib.h>
 
@@ -48,8 +48,7 @@ sm_quat sm_qbetween(const double u[3], const double v[3]) {
     return (sm_quat){w / n, c[0] / n, c[1] / n, c[2] / n};
 }
 
-/* recover_from_ric: yaw = cumsum of rot_vel shifted by one frame; root xz = cumsum of the velocities turned by the
-   inverse yaw; local joint positions turned by the inverse yaw and moved by the root xz */
+/* recover_from_ric: yaw and root xz are running sums of the velocities, the joints turned by the inverse yaw */
 void sm_features_to_joints(const float *feat, uint32_t T, sm_track *tr, float *joints) {
     double yaw = tr->yaw, x = tr->x, z = tr->z;
     for (uint32_t t = 0; t < T; t++) {
@@ -102,9 +101,7 @@ static sm_quat turn(double a0[3], const double b0[3], double a1[3], const double
     return sm_qmul(sm_qbetween(p0, p1), q);
 }
 
-/* global rotation S of each joint, which turns its rest offsets towards its children: the pelvis from the hip line and
-   spine1, the chest from the neck and the shoulder line, every other joint the shortest arc from its parent's
-   (the usual per-bone IK), a leaf its parent's. Out: S relative to the parent's, x y z w. */
+/* each joint's rotation turns its rest offsets towards its children; out relative to the parent's, x y z w */
 static sm_quat pelvis_rotation(const float *j, const float *rest) {
     double a0[3], b0[3], a1[3], b1[3];
     dif(rest, SM_L_HIP, SM_R_HIP, a0);
@@ -160,8 +157,7 @@ static int cmp(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
-/* each joint's offset in its parent's frame, the median over the frames per axis. Bones the rotations aim keep the
-   rest direction and get the median length; the pelvis and chest side bones get their median place. tmp: 3T doubles */
+/* each joint's offset in its parent's frame, the median over the frames per axis; tmp: 3T doubles */
 void sm_clip_offsets(const float *joints, const float *xyzw, uint32_t T, double *tmp, float *off) {
     memset(off, 0, sizeof(float) * 3);
     for (int j = 1; j < SM_J; j++) {
@@ -208,8 +204,7 @@ static void leg_ik(float *j, int hip, int knee, int ankle, int toe, const double
 
 #define BLEND 4   /* frames over which a lock fades in and out */
 
-/* while a foot is planted (ankle or toe contact) its toe keeps the yaw it had at touch-down, and returns over BLEND
-   frames after lift-off: a path warp turns the body, which would swivel a planted foot */
+/* a path warp turns the body, which would swivel a planted foot: its toe keeps the yaw it had at touch-down */
 static void hold_yaw(float *joints, const uint8_t *contacts, uint32_t T, int side, const double *yaw_added) {
     const int ankle = SM_L_ANKLE + side, toe = SM_L_FOOT + side, col = 2 * side;
     double at_touch = 0, offset = 0;
@@ -285,10 +280,8 @@ void sm_foot_lock(float *joints, const uint8_t *contacts, uint32_t T, double *de
     }
 }
 
-#define GAP 20   /* frames: a foot column with no contact this long has its flags missing (runs) */
+#define GAP 20   /* frames: a foot with no contact this long has its flags missing (runs) */
 
-/* where a column has no flag for GAP frames, its joint is on the ground while it is low and slow, as the flags are
-   set in walks: ankle below 10 cm, toe below 4 cm, slower than 0.8 m/s */
 #define MAX_CONTACT_SPEED 0.8   /* m/s */
 
 static uint8_t low_and_slow(const float *joints, uint32_t T, uint32_t t, int joint, float low, double fps) {
@@ -301,13 +294,14 @@ static uint8_t low_and_slow(const float *joints, uint32_t T, uint32_t t, int joi
 
 void sm_fill_contacts(const float *joints, uint8_t *contacts, uint32_t T, double fps) {
     static const int joint[4] = {SM_L_ANKLE, SM_L_FOOT, SM_R_ANKLE, SM_R_FOOT};
-    static const float low[4] = {0.10f, 0.04f, 0.10f, 0.04f};   /* m */
+    static const float low[4] = {0.10f, 0.04f, 0.10f, 0.04f};   /* m, as the flags are set in walks */
     for (uint32_t k = 0; k < 4; k++) {
         uint32_t end;
         for (uint32_t start = 0; start < T; start = end + 1) {
             for (end = start; end < T && !contacts[4 * end + k]; end++) {}
             if (end - start < GAP) continue;
-            for (uint32_t t = start; t < end; t++) contacts[4 * t + k] = low_and_slow(joints, T, t, joint[k], low[k], fps);
+            for (uint32_t t = start; t < end; t++)
+                contacts[4 * t + k] = low_and_slow(joints, T, t, joint[k], low[k], fps);
         }
     }
 }

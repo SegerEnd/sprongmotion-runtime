@@ -1,5 +1,4 @@
-/* Matrix multiply on F32 or Q8_0 weights (bias, GELU or residual add fused into the store), transformer
-   encoder layers as torch.nn.TransformerEncoderLayer (eval, GELU), and the motion VQ decoder. */
+/* The matrix kernel, transformer layers (torch.nn.TransformerEncoderLayer, eval) and the VQ decoder and encoder. */
 #include "sm_internal.h"
 
 #define KC 512   /* K slice: a 32 KB panel that stays in L1 */
@@ -315,7 +314,7 @@ static uint32_t conv(const sm_par *par, const float *x, uint32_t T, conv_shape s
     return To;
 }
 
-/* the common case: stride 1, dilation 1, W in */
+/* stride 1, dilation 1, SM_VQ_W channels in */
 static uint32_t conv3(const sm_par *par, const float *x, uint32_t T, sm_conv w, uint32_t out, int relu_in, float *y) {
     return conv(par, x, T, (conv_shape){w, SM_VQ_W, out, 3, 1, 1, (uint32_t)relu_in}, y);
 }
@@ -346,7 +345,7 @@ static void sum_codes(const sm_vq *v, const int16_t *codes, uint32_t L, float *x
         }
 }
 
-/* the VQ decoder: summed code vectors, then a conv1d stack; activations are [T][C] */
+/* activations are [T][C] */
 size_t sm_vq_scratch_floats(uint32_t L) { return (size_t)3 * 2 * L * SM_VQ_W; }
 
 void sm_vq_decode(const sm_vq *v, const int16_t *codes, uint32_t L, float *feat, float *scratch) {

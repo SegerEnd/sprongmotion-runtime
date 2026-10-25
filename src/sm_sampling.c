@@ -1,5 +1,4 @@
-/* Sampling: the hashed Gumbel noise, top-k picks, the mask schedule, and exp, log and float16 rounding that give the
-   same bits on every target. */
+/* Sampling noise, top-k picks, the mask schedule, and exp, log and float16 rounding with the same bits everywhere. */
 #include "sm_internal.h"
 
 #define PICK_ROWS 4      /* rows per task */
@@ -116,8 +115,7 @@ static double pow2i(int64_t n) {   /* 2^n for -1022 <= n <= 1023 */
     return d;
 }
 
-/* exp and log from + - * / only, so every target gives the same bits.
-   exp(x) = 2^n exp(r), |r| <= ln2/2; Taylor to r^13 (error < 1e-17), Horner on 1/k! */
+/* + - * / only, so every target gives the same bits: exp(x) = 2^n exp(r), |r| <= ln2/2, Taylor to r^13 */
 double sm_exp(double x) {
     if (x != x) return x;
     if (x < -745) return 0;

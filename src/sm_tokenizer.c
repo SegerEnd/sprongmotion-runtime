@@ -1,5 +1,4 @@
-/* CLIP's BPE tokenizer (openai/CLIP simple_tokenizer.py) with its ftfy / html.unescape cleanup.
-   Not covered: NFC composition of decomposed input, ftfy's mojibake repair, rare HTML entity names. */
+/* CLIP's BPE tokenizer (openai/CLIP simple_tokenizer.py) with its ftfy and html.unescape cleanup. */
 #include "sm_internal.h"
 
 #define MAX_CP      0x10FFFFu
@@ -134,7 +133,7 @@ static uint32_t digit(uint32_t c, int hex) {
     return hex && low >= 'a' && low <= 'f' ? low - 'a' + 10 : NO_DIGIT;
 }
 
-/* Python's html._replace_charref: a table of fixes, then surrogates and values past Unicode become U+FFFD; -1 drops */
+/* Python's html._replace_charref: its table of fixes, U+FFFD past Unicode and for surrogates; -1 drops it */
 static int64_t ref_codepoint(const sm_tok *t, uint64_t v) {
     const uint32_t f = search(t->num_fix, t->n_num_fix, 2, 0, v);
     if (f < t->n_num_fix && (uint64_t)t->num_fix[2 * f] == v) return t->num_fix[2 * f + 1];
@@ -178,7 +177,7 @@ static int named_ref(const sm_tok *t, const uint32_t *s, size_t n, size_t i, uin
     return 1;
 }
 
-/* html.unescape, matched as Python does; anything else is left as is */
+/* html.unescape, matched as Python does */
 static size_t unescape(const sm_tok *t, const uint32_t *s, size_t n, uint32_t *dst) {
     size_t count = 0;
     for (size_t i = 0; i < n; i++) {
@@ -250,14 +249,14 @@ static int32_t bpe(const sm_tok *t, int32_t *sym, int32_t n) {
     return n;
 }
 
-/* the length of literal at s[i], or 0 */
 static size_t match(const uint32_t *s, size_t n, size_t i, const char *literal) {
     size_t len = 0;
     while (literal[len] && i + len < n && s[i + len] == (uint8_t)literal[len]) len++;
     return literal[len] ? 0 : len;
 }
 
-/* decoded, ftfy-fixed, unescaped twice (as CLIP's basic_clean) and lowercased into w->cp[1] */
+/* CLIP's basic_clean (unescaped twice) and lowercase, into w->cp[1]. Not covered: NFC composition, ftfy's mojibake
+   repair, rare entity names */
 static size_t clean_text(const sm_tok *t, const char *utf8, size_t len, sm_tok_work *w) {
     uint32_t *a = w->cp[0], *b = w->cp[1];
     size_t n = utf8_decode(utf8, len, a, SM_TOK_MAX_CP);
