@@ -32,39 +32,39 @@ static void transpose_store(const v4 r[4], float *buf) {
 }
 
 /* 16 consecutive weights of a row, dequantized: 4 vectors */
-static void row16(const sm_lin *l, uint32_t n, uint32_t k, v4 out[4]) {
+static void row16(const sm_lin *l, uint32_t row, uint32_t k, v4 out[4]) {
     if (l->type == SM_T_F32) {
-        const float *w = (const float *)l->w + (size_t)n * l->k + k;
+        const float *w = (const float *)l->w + (size_t)row * l->k + k;
         for (int i = 0; i < 4; i++) out[i] = sm_load4(w + 4 * i);
         return;
     }
-    const uint8_t *blk = (const uint8_t *)l->w + ((size_t)n * (l->k / 32) + k / 32) * SM_Q8_BLOCK;
-    const float d = sm_half((uint16_t)(blk[0] | blk[1] << 8));
+    const uint8_t *block = (const uint8_t *)l->w + ((size_t)row * (l->k / 32) + k / 32) * SM_Q8_BLOCK;
+    const float scale = sm_half((uint16_t)(block[0] | block[1] << 8));
     i8x16 q;
-    memcpy(&q, blk + 2 + k % 32, 16);
-    out[0] = d * __builtin_convertvector(__builtin_shufflevector(q, q, 0, 1, 2, 3), v4);
-    out[1] = d * __builtin_convertvector(__builtin_shufflevector(q, q, 4, 5, 6, 7), v4);
-    out[2] = d * __builtin_convertvector(__builtin_shufflevector(q, q, 8, 9, 10, 11), v4);
-    out[3] = d * __builtin_convertvector(__builtin_shufflevector(q, q, 12, 13, 14, 15), v4);
+    memcpy(&q, block + 2 + k % 32, 16);
+    out[0] = scale * __builtin_convertvector(__builtin_shufflevector(q, q, 0, 1, 2, 3), v4);
+    out[1] = scale * __builtin_convertvector(__builtin_shufflevector(q, q, 4, 5, 6, 7), v4);
+    out[2] = scale * __builtin_convertvector(__builtin_shufflevector(q, q, 8, 9, 10, 11), v4);
+    out[3] = scale * __builtin_convertvector(__builtin_shufflevector(q, q, 12, 13, 14, 15), v4);
 }
 
-void sm_row(const sm_lin *t, uint32_t i, float *out) {
-    for (uint32_t k = 0; k < t->k; k += 16) {
-        v4 r[4];
-        row16(t, i, k, r);
-        for (int c = 0; c < 4; c++) sm_store4(out + k + 4 * c, r[c]);
+void sm_row(const sm_lin *table, uint32_t row, float *out) {
+    for (uint32_t k = 0; k < table->k; k += 16) {
+        v4 chunk[4];
+        row16(table, row, k, chunk);
+        for (int c = 0; c < 4; c++) sm_store4(out + k + 4 * c, chunk[c]);
     }
 }
 
-/* buf[k][j] = W[n0 + j][k0 + k] */
+/* buf[k][j] = W[n0 + j][k0 + k] for a panel of NP columns and kc of K */
 static void expand(const sm_lin *l, uint32_t n0, uint32_t k0, uint32_t kc, float *buf) {
     for (uint32_t j = 0; j < NP; j += 4)
         for (uint32_t k = 0; k < kc; k += 16) {
-            v4 r[4][4], t[4];
-            for (uint32_t i = 0; i < 4; i++) row16(l, n0 + j + i, k0 + k, r[i]);
+            v4 rows[4][4], chunk[4];
+            for (uint32_t i = 0; i < 4; i++) row16(l, n0 + j + i, k0 + k, rows[i]);
             for (int c = 0; c < 4; c++) {
-                for (int i = 0; i < 4; i++) t[i] = r[i][c];
-                transpose_store(t, buf + (k + 4 * (uint32_t)c) * NP + j);
+                for (int i = 0; i < 4; i++) chunk[i] = rows[i][c];
+                transpose_store(chunk, buf + (k + 4 * (uint32_t)c) * NP + j);
             }
         }
 }
@@ -93,65 +93,67 @@ static void epilogue(const sm_lin *l, uint32_t M, uint32_t n0, float *Y, sm_epi 
             for (uint32_t j = 0; j < NP; j++) y[j] = sm_gelu(y[j]);
             continue;
         }
-        const float *r = add + (size_t)m * l->n + n0;
-        for (uint32_t j = 0; j < NP; j++) y[j] += r[j];
+        const float *residual = add + (size_t)m * l->n + n0;
+        for (uint32_t j = 0; j < NP; j++) y[j] += residual[j];
     }
 }
 
-void sm_pack(sm_lin *l, float *p) {
-    for (uint32_t n0 = 0; n0 < l->n; n0 += NP) expand(l, n0, 0, l->k, p + (size_t)n0 * l->k);
-    l->p = p;
+void sm_pack(sm_lin *l, float *panels) {
+    for (uint32_t n0 = 0; n0 < l->n; n0 += NP) expand(l, n0, 0, l->k, panels + (size_t)n0 * l->k);
+    l->p = panels;
 }
 
-typedef struct { const sm_lin *l; const float *X; uint32_t M; float *Y; sm_epi epi; const float *add; } job;
+typedef struct { const sm_lin *l; const float *X; uint32_t M; float *Y; sm_epi epi; const float *add; } linear_job;
 
 /* one task: output columns [16 i, 16 i + 16) of every row, all of K */
 static void panel(void *arg, uint32_t i) {
-    const job *j = arg;
-    const sm_lin *l = j->l;
-    const uint32_t K = l->k, N = l->n, M = j->M, n0 = i * NP;
+    const linear_job *job = arg;
+    const sm_lin *l = job->l;
+    const uint32_t K = l->k, N = l->n, M = job->M, n0 = i * NP;
     float tmp[KC * NP];
     for (uint32_t k0 = 0; k0 < K; k0 += KC) {
         const uint32_t kc = K - k0 < KC ? K - k0 : KC;
-        const float *b = l->b && k0 + kc == K ? l->b + n0 : NULL, *x = j->X + k0, *buf = tmp;
-        float *y = j->Y + n0;
-        if (l->p) buf = l->p + (size_t)n0 * K + (size_t)k0 * NP;
-        else expand(l, n0, k0, kc, tmp);
+        const float *bias = l->b && k0 + kc == K ? l->b + n0 : NULL, *x = job->X + k0;
+        const float *buf = l->p ? l->p + (size_t)n0 * K + (size_t)k0 * NP : tmp;
+        float *y = job->Y + n0;
+        if (!l->p) expand(l, n0, k0, kc, tmp);
         uint32_t m = 0;
-        for (; m + TR <= M; m += TR) tile(TR, x + (size_t)m * K, K, buf, kc, y + (size_t)m * N, N, k0 > 0, b);
-        for (; m < M; m++) tile(1, x + (size_t)m * K, K, buf, kc, y + (size_t)m * N, N, k0 > 0, b);
+        for (; m + TR <= M; m += TR) tile(TR, x + (size_t)m * K, K, buf, kc, y + (size_t)m * N, N, k0 > 0, bias);
+        for (; m < M; m++) tile(1, x + (size_t)m * K, K, buf, kc, y + (size_t)m * N, N, k0 > 0, bias);
     }
-    if (j->epi != SM_EPI_NONE) epilogue(l, M, n0, j->Y, j->epi, j->add);
+    if (job->epi != SM_EPI_NONE) epilogue(l, M, n0, job->Y, job->epi, job->add);
 }
 
 void sm_linear(const sm_par *par, const sm_lin *l, const float *X, uint32_t M, float *Y, sm_epi epi, const float *add) {
-    job j = {l, X, M, Y, epi, add};
-    sm_par_for(par, l->n / NP, panel, &j);
+    linear_job job = {l, X, M, Y, epi, add};
+    sm_par_for(par, l->n / NP, panel, &job);
 }
 
 #define LN_ROWS 16   /* rows per task */
 
-typedef struct { const float *x; uint32_t M, d; sm_norm n; double eps; float *y; } ln_job;
+typedef struct { const float *x; uint32_t M, d; sm_norm norm; double eps; float *y; } norm_job;
 
 /* biased variance; statistics in double, summed in 4 interleaved partial sums */
-static void ln_rows(void *arg, uint32_t task) {
-    const ln_job *j = arg;
-    const uint32_t d = j->d, end = (task + 1) * LN_ROWS < j->M ? (task + 1) * LN_ROWS : j->M;
-    for (uint32_t m = task * LN_ROWS; m < end; m++) {
-        const float *x = j->x + (size_t)m * d;
-        double s[4] = {0}, v[4] = {0};
-        for (uint32_t i = 0; i < d; i++) s[i % 4] += x[i];
-        const double mean = ((s[0] + s[1]) + (s[2] + s[3])) / d;
-        for (uint32_t i = 0; i < d; i++) v[i % 4] += (x[i] - mean) * (x[i] - mean);
-        const double inv = 1.0 / sqrt(((v[0] + v[1]) + (v[2] + v[3])) / d + j->eps);
-        float *y = j->y + (size_t)m * d;
-        for (uint32_t i = 0; i < d; i++) y[i] = (float)((x[i] - mean) * inv) * j->n.w[i] + j->n.b[i];
-    }
+static void normalize_row(const norm_job *job, const float *x, float *y) {
+    const uint32_t d = job->d;
+    double sum[4] = {0}, var[4] = {0};
+    for (uint32_t i = 0; i < d; i++) sum[i % 4] += x[i];
+    const double mean = ((sum[0] + sum[1]) + (sum[2] + sum[3])) / d;
+    for (uint32_t i = 0; i < d; i++) var[i % 4] += (x[i] - mean) * (x[i] - mean);
+    const double inv = 1.0 / sqrt(((var[0] + var[1]) + (var[2] + var[3])) / d + job->eps);
+    for (uint32_t i = 0; i < d; i++) y[i] = (float)((x[i] - mean) * inv) * job->norm.w[i] + job->norm.b[i];
 }
 
-void sm_layernorm(const sm_par *par, const float *x, uint32_t M, uint32_t d, sm_norm n, double eps, float *y) {
-    ln_job j = {x, M, d, n, eps, y};
-    sm_par_for(par, (M + LN_ROWS - 1) / LN_ROWS, ln_rows, &j);
+static void normalize_rows(void *arg, uint32_t task) {
+    const norm_job *job = arg;
+    const uint32_t end = (task + 1) * LN_ROWS < job->M ? (task + 1) * LN_ROWS : job->M;
+    for (uint32_t m = task * LN_ROWS; m < end; m++)
+        normalize_row(job, job->x + (size_t)m * job->d, job->y + (size_t)m * job->d);
+}
+
+void sm_layernorm(const sm_par *par, const float *x, uint32_t M, uint32_t d, sm_norm norm, double eps, float *y) {
+    norm_job job = {x, M, d, norm, eps, y};
+    sm_par_for(par, (M + LN_ROWS - 1) / LN_ROWS, normalize_rows, &job);
 }
 
 #define QB 4   /* query rows per block */
@@ -176,9 +178,9 @@ INLINE void qk(int R, int J, const head *h, uint32_t i, uint32_t j, float scale,
 
 /* in place: p = exp(p - max) zero-padded to a multiple of 4; returns 1 / sum */
 static float softmax_row(float *p, uint32_t S) {
-    float mx = -INFINITY;
-    for (uint32_t j = 0; j < S; j++) mx = p[j] > mx ? p[j] : mx;
-    for (uint32_t j = 0; j < S; j++) p[j] = sm_expf(p[j] - mx);
+    float max = -INFINITY;
+    for (uint32_t j = 0; j < S; j++) max = p[j] > max ? p[j] : max;
+    for (uint32_t j = 0; j < S; j++) p[j] = sm_expf(p[j] - max);
     for (uint32_t j = S; j % 4; j++) p[j] = 0;
     v4 sum = {0};
     for (uint32_t j = 0; j < S; j += 4) sum += sm_load4(p + j);
@@ -214,16 +216,16 @@ INLINE void rows(int R, const head *h, uint32_t i, float *p, uint32_t ps, float 
     pv(R, h, p, ps, inv, o, od);
 }
 
-typedef struct { const float *qkv; const sm_batch *b; uint32_t d, heads, stride; float *out, *p; } attn;
+typedef struct { const float *qkv; const sm_batch *b; uint32_t d, heads, stride; float *out, *p; } attention_job;
 
 /* one task: one head of one sequence; qkv rows hold q, k, v of all heads */
 static void attend(void *arg, uint32_t task) {
-    const attn *a = arg;
-    const sm_seg seg = a->b->seg[task / a->heads];
-    const uint32_t d = a->d, hd = d / a->heads, w = 3 * d, ps = a->stride;
-    const float *q = a->qkv + (size_t)seg.start * w + task % a->heads * hd;
-    const head h = {q, q + d, q + 2 * d, seg.len, w, hd};
-    float *p = a->p + (size_t)task * QB * ps, *o = a->out + (size_t)seg.start * d + task % a->heads * hd;
+    const attention_job *job = arg;
+    const sm_seg seg = job->b->seg[task / job->heads];
+    const uint32_t d = job->d, hd = d / job->heads, width = 3 * d, ps = job->stride;
+    const float *q = job->qkv + (size_t)seg.start * width + task % job->heads * hd;
+    const head h = {q, q + d, q + 2 * d, seg.len, width, hd};
+    float *p = job->p + (size_t)task * QB * ps, *o = job->out + (size_t)seg.start * d + task % job->heads * hd;
     uint32_t i = 0;
     for (; i + QB <= seg.len; i += QB) rows(QB, &h, i, p, ps, o + (size_t)i * d, d);
     for (; i < seg.len; i++) rows(1, &h, i, p, ps, o + (size_t)i * d, d);
@@ -231,8 +233,8 @@ static void attend(void *arg, uint32_t task) {
 
 static void attention(const sm_par *par, const float *qkv, const sm_batch *b, uint32_t d, uint32_t heads, float *out,
                       float *p) {
-    attn a = {qkv, b, d, heads, b->rows + 4, out, p};
-    sm_par_for(par, b->n_seg * heads, attend, &a);
+    attention_job job = {qkv, b, d, heads, b->rows + 4, out, p};
+    sm_par_for(par, b->n_seg * heads, attend, &job);
 }
 
 static uint32_t widest(uint32_t d, uint32_t ff) { return 3 * d > ff ? 3 * d : ff; }
@@ -275,53 +277,73 @@ void sm_layer_pre(const sm_par *par, const sm_layer *l, const sm_batch *b, uint3
 
 #define CONV_ROWS 8   /* output frames per task */
 
-typedef struct {
-    const float *x; uint32_t T, C; sm_conv w; uint32_t O, K, dil, stride, To; int relu_in; float *y;
-} conv_job;
+/* a 1D convolution over [T][C] frames: kernel K, dilation, stride, optionally a ReLU on its input */
+typedef struct { sm_conv w; uint32_t C, O, K, dilation, stride, relu_in; } conv_shape;
+typedef struct { const float *x; uint32_t T, To; conv_shape s; float *y; } conv_job;
 
-static void conv_rows(void *arg, uint32_t task) {
-    const conv_job *j = arg;
-    const int64_t pad = (int64_t)((j->K - 1) * j->dil / 2);
-    const uint32_t C = j->C, O = j->O, end = (task + 1) * CONV_ROWS < j->To ? (task + 1) * CONV_ROWS : j->To;
-    for (uint32_t t = task * CONV_ROWS; t < end; t++) {
-        float *yt = j->y + (size_t)t * O;
-        memcpy(yt, j->w.b, sizeof(float) * O);
-        for (uint32_t k = 0; k < j->K; k++) {
-            const int64_t s = (int64_t)t * j->stride + (int64_t)(k * j->dil) - pad;
-            if (s < 0 || s >= (int64_t)j->T) continue;
-            const float *xs = j->x + (size_t)s * C, *wk = j->w.w + (size_t)k * C * O;
-            for (uint32_t c = 0; c < C; c++) {
-                const float v = j->relu_in && xs[c] < 0 ? 0 : xs[c];
-                if (v == 0) continue;   /* exact, and ReLU outputs are often zero */
-                const float *wc = wk + (size_t)c * O;
-                for (uint32_t o = 0; o < O; o++) yt[o] += v * wc[o];
-            }
+static void conv_frame(const conv_job *job, uint32_t t, int64_t pad) {
+    const conv_shape *s = &job->s;
+    float *yt = job->y + (size_t)t * s->O;
+    memcpy(yt, s->w.b, sizeof(float) * s->O);
+    for (uint32_t k = 0; k < s->K; k++) {
+        const int64_t src = (int64_t)t * s->stride + (int64_t)(k * s->dilation) - pad;
+        if (src < 0 || src >= (int64_t)job->T) continue;
+        const float *xs = job->x + (size_t)src * s->C, *wk = s->w.w + (size_t)k * s->C * s->O;
+        for (uint32_t c = 0; c < s->C; c++) {
+            const float v = s->relu_in && xs[c] < 0 ? 0 : xs[c];
+            if (v == 0) continue;   /* exact, and ReLU outputs are often zero */
+            const float *wc = wk + (size_t)c * s->O;
+            for (uint32_t o = 0; o < s->O; o++) yt[o] += v * wc[o];
         }
     }
 }
 
+static void conv_frames(void *arg, uint32_t task) {
+    const conv_job *job = arg;
+    const int64_t pad = (int64_t)((job->s.K - 1) * job->s.dilation / 2);
+    const uint32_t end = (task + 1) * CONV_ROWS < job->To ? (task + 1) * CONV_ROWS : job->To;
+    for (uint32_t t = task * CONV_ROWS; t < end; t++) conv_frame(job, t, pad);
+}
+
 /* y[t][o] = b[o] + sum_k sum_c act(x[t stride + k dil - pad][c]) w[k][c][o], zero padding pad = (K - 1) dil / 2
-   (PyTorch's padding 1 for the stride-2 K = 4 conv); act = ReLU if relu_in. Returns the output length. */
-static uint32_t conv(const sm_par *par, const float *x, uint32_t T, uint32_t C, sm_conv w, uint32_t O, uint32_t K,
-                     uint32_t dil, uint32_t stride, int relu_in, float *y) {
-    const int64_t pad = (int64_t)((K - 1) * dil / 2);
-    const uint32_t To = (uint32_t)(((int64_t)T + 2 * pad - (int64_t)(dil * (K - 1)) - 1) / stride + 1);
-    conv_job j = {x, T, C, w, O, K, dil, stride, To, relu_in, y};
-    sm_par_for(par, (To + CONV_ROWS - 1) / CONV_ROWS, conv_rows, &j);
+   (PyTorch's padding 1 for the stride-2 K = 4 conv). Returns the output length. */
+static uint32_t conv(const sm_par *par, const float *x, uint32_t T, conv_shape s, float *y) {
+    const int64_t pad = (int64_t)((s.K - 1) * s.dilation / 2);
+    const uint32_t To = (uint32_t)(((int64_t)T + 2 * pad - (int64_t)(s.dilation * (s.K - 1)) - 1) / s.stride + 1);
+    conv_job job = {x, T, To, s, y};
+    sm_par_for(par, (To + CONV_ROWS - 1) / CONV_ROWS, conv_frames, &job);
     return To;
 }
 
-static const uint32_t dil[3] = {9, 3, 1};   /* Resnet1D with reverse_dilation: 3^2, 3^1, 3^0 */
+/* the common case: stride 1, dilation 1, W in */
+static uint32_t conv3(const sm_par *par, const float *x, uint32_t T, sm_conv w, uint32_t out, int relu_in, float *y) {
+    return conv(par, x, T, (conv_shape){w, SM_VQ_W, out, 3, 1, 1, (uint32_t)relu_in}, y);
+}
 
-/* b += conv2(relu(conv1(relu(b)))) per block; a, c: scratch of b's size */
-static void res_stack(const sm_par *par, const sm_conv *c1, const sm_conv *c2, float *b, uint32_t L, float *a,
-                      float *c) {
+static const uint32_t dilations[3] = {9, 3, 1};   /* Resnet1D with reverse_dilation: 3^2, 3^1, 3^0 */
+
+/* x += conv2(relu(conv1(relu(x)))) per block; a, b: scratch of x's size */
+static void res_stack(const sm_par *par, const sm_conv *conv1, const sm_conv *conv2, float *x, uint32_t L, float *a,
+                      float *b) {
     const size_t n = (size_t)L * SM_VQ_W;
     for (int r = 0; r < 3; r++) {
-        conv(par, b, L, SM_VQ_W, c1[r], SM_VQ_W, 3, dil[r], 1, 1, a);
-        conv(par, a, L, SM_VQ_W, c2[r], SM_VQ_W, 1, 1, 1, 1, c);
-        for (size_t i = 0; i < n; i++) b[i] += c[i];
+        conv(par, x, L, (conv_shape){conv1[r], SM_VQ_W, SM_VQ_W, 3, dilations[r], 1, 1}, a);
+        conv(par, a, L, (conv_shape){conv2[r], SM_VQ_W, SM_VQ_W, 1, 1, 1, 1}, b);
+        for (size_t i = 0; i < n; i++) x[i] += b[i];
     }
+}
+
+/* code -1: the layer is left out */
+static void sum_codes(const sm_vq *v, const int16_t *codes, uint32_t L, float *x) {
+    const uint32_t W = SM_VQ_W;
+    memset(x, 0, sizeof(float) * L * W);
+    for (uint32_t t = 0; t < L; t++)
+        for (uint32_t q = 0; q < SM_VQ_LAYERS; q++) {
+            const int16_t id = codes[t * SM_VQ_LAYERS + q];
+            if (id < 0) continue;
+            const float *e = v->codebook + ((size_t)q * SM_VQ_N + (size_t)(uint16_t)id) * W;
+            for (uint32_t i = 0; i < W; i++) x[(size_t)t * W + i] += e[i];
+        }
 }
 
 /* the VQ decoder: summed code vectors, then a conv1d stack; activations are [T][C] */
@@ -332,22 +354,17 @@ void sm_vq_decode(const sm_vq *v, const int16_t *codes, uint32_t L, float *feat,
     const size_t n = (size_t)L * W;
     float *a = scratch, *b = a + (size_t)T * W, *c = b + (size_t)T * W;
 
-    memset(a, 0, sizeof(float) * n);   /* code -1: layer left out */
-    for (uint32_t t = 0; t < L; t++)
-        for (uint32_t q = 0; q < SM_VQ_LAYERS; q++) {
-            const int16_t id = codes[t * SM_VQ_LAYERS + q];
-            if (id < 0) continue;
-            const float *e = v->codebook + ((size_t)q * SM_VQ_N + (size_t)(uint16_t)id) * W;
-            for (uint32_t i = 0; i < W; i++) a[(size_t)t * W + i] += e[i];
-        }
-    conv(v->par, a, L, W, v->in, W, 3, 1, 1, 0, b);   /* the residual stream starts after this ReLU */
-    for (size_t i = 0; i < n; i++) b[i] = b[i] < 0 ? 0 : b[i];
+    sum_codes(v, codes, L, a);
+    conv3(v->par, a, L, v->in, W, 0, b);
+    for (size_t i = 0; i < n; i++) b[i] = b[i] < 0 ? 0 : b[i];   /* the residual stream starts after this ReLU */
     res_stack(v->par, v->res1, v->res2, b, L, a, c);
+
     for (uint32_t t = 0; t < T; t++)   /* nearest 2x upsampling */
         memcpy(a + (size_t)t * W, b + (size_t)(t / 2) * W, sizeof(float) * W);
-    conv(v->par, a, T, W, v->up, W, 3, 1, 1, 0, b);
-    conv(v->par, b, T, W, v->mid, W, 3, 1, 1, 0, a);
-    conv(v->par, a, T, W, v->out, SM_F, 3, 1, 1, 1, feat);   /* ReLU on its input (after model.3) */
+    conv3(v->par, a, T, v->up, W, 0, b);
+    conv3(v->par, b, T, v->mid, W, 0, a);
+    conv3(v->par, a, T, v->out, SM_F, 1, feat);   /* ReLU on its input (after model.3) */
+
     for (uint32_t t = 0; t < T; t++) {
         float *ft = feat + (size_t)t * SM_F;
         for (uint32_t i = 0; i < SM_F; i++) ft[i] = ft[i] * v->std[i] + v->mean[i];
@@ -356,32 +373,44 @@ void sm_vq_decode(const sm_vq *v, const int16_t *codes, uint32_t L, float *feat,
 
 size_t sm_vq_enc_scratch_floats(uint32_t T) { return (size_t)T * (SM_F + SM_VQ_W) + (size_t)2 * (T / 2) * SM_VQ_W; }
 
-/* out(res(down(relu(in((feat - mean) / std))))), then residual quantization: the squared distance in double, the
-   first of equal ones (torch argmin), the residual in float as torch subtracts it */
+/* the nearest code: the squared distance in double, the first of equal ones (torch argmin) */
+static uint32_t nearest_code(const float *codebook, const float *x) {
+    double best = INFINITY;
+    uint32_t pick = 0;
+    for (uint32_t k = 0; k < SM_VQ_N; k++) {
+        const float *code = codebook + (size_t)k * SM_VQ_W;
+        double d2 = 0;
+        for (uint32_t i = 0; i < SM_VQ_W; i++) d2 += ((double)x[i] - code[i]) * ((double)x[i] - code[i]);
+        if (d2 < best) {
+            best = d2;
+            pick = k;
+        }
+    }
+    return pick;
+}
+
+/* each layer picks the nearest code to what the layers before left, the residual in float as torch subtracts it */
+static void quantize(const sm_vq *v, float *residual, int16_t *codes) {
+    for (uint32_t q = 0; q < SM_VQ_LAYERS; q++) {
+        const float *codebook = v->codebook + (size_t)q * SM_VQ_N * SM_VQ_W;
+        const uint32_t pick = nearest_code(codebook, residual);
+        for (uint32_t i = 0; i < SM_VQ_W; i++) residual[i] -= codebook[(size_t)pick * SM_VQ_W + i];
+        codes[q] = (int16_t)pick;
+    }
+}
+
+/* out(res(down(relu(in((feat - mean) / std))))), then residual quantization */
 void sm_vq_encode(const sm_vq *v, const float *feat, uint32_t T, int16_t *codes, float *scratch) {
     const sm_vq_enc *e = &v->enc;
     const uint32_t W = SM_VQ_W, L = T / 2;
     float *x = scratch, *a = x + (size_t)T * SM_F, *b = a + (size_t)T * W, *c = b + (size_t)L * W;
     for (size_t t = 0; t < T; t++)
         for (size_t i = 0; i < SM_F; i++) x[t * SM_F + i] = (feat[t * SM_F + i] - v->mean[i]) / v->std[i];
-    conv(v->par, x, T, SM_F, e->in, W, 3, 1, 1, 0, a);
-    conv(v->par, a, T, W, e->down, W, 4, 1, 2, 1, b);
+
+    conv(v->par, x, T, (conv_shape){e->in, SM_F, W, 3, 1, 1, 0}, a);
+    conv(v->par, a, T, (conv_shape){e->down, W, W, 4, 1, 2, 1}, b);
     res_stack(v->par, e->res1, e->res2, b, L, a, c);
-    conv(v->par, b, L, W, e->out, W, 3, 1, 1, 0, c);
-    for (uint32_t t = 0; t < L; t++) {
-        float *r = c + (size_t)t * W;
-        for (uint32_t q = 0; q < SM_VQ_LAYERS; q++) {
-            const float *cb = v->codebook + (size_t)q * SM_VQ_N * W;
-            double best = INFINITY;
-            uint32_t pick = 0;
-            for (uint32_t k = 0; k < SM_VQ_N; k++) {
-                const float *ck = cb + (size_t)k * W;
-                double d2 = 0;
-                for (uint32_t i = 0; i < W; i++) d2 += ((double)r[i] - ck[i]) * ((double)r[i] - ck[i]);
-                if (d2 < best) best = d2, pick = k;
-            }
-            for (uint32_t i = 0; i < W; i++) r[i] -= cb[(size_t)pick * W + i];
-            codes[t * SM_VQ_LAYERS + q] = (int16_t)pick;
-        }
-    }
+    conv3(v->par, b, L, e->out, W, 0, c);
+
+    for (uint32_t t = 0; t < L; t++) quantize(v, c + (size_t)t * W, codes + t * SM_VQ_LAYERS);
 }

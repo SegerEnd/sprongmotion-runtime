@@ -3,7 +3,7 @@
    xz velocity and height, local joint positions, 6D joint rotations, joint velocities and foot contacts. */
 #include "sm_internal.h"
 
-static const double raw[SM_J][3] = {
+static const double rest_direction[SM_J][3] = {
     {0, 0, 0}, {1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, -1, 0}, {0, 1, 0}, {0, -1, 0}, {0, -1, 0}, {0, 1, 0},
     {0, 0, 1}, {0, 0, 1}, {0, 1, 0}, {1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, -1, 0}, {0, -1, 0}, {0, -1, 0},
     {0, -1, 0}, {0, -1, 0}, {0, -1, 0},
@@ -19,90 +19,122 @@ static const int8_t chains[5][7] = {
     {0, 2, 5, 8, 11, -1}, {0, 1, 4, 7, 10, -1}, {0, 3, 6, 9, 12, 15, -1}, {9, 14, 17, 19, 21, -1},
     {9, 13, 16, 18, 20, -1},
 };
-enum { SIGMA = 20, RADIUS = 80 };   /* the facing smoothing: scipy gaussian_filter1d, radius int(4 sigma + 0.5) */
+static const int feet[4] = {SM_L_ANKLE, SM_L_FOOT, SM_R_ANKLE, SM_R_FOOT};
 
-static void sub(const double *a, const double *b, double *o) { for (int k = 0; k < 3; k++) o[k] = a[k] - b[k]; }
+enum { SIGMA = 20, RADIUS = 80 };   /* the facing smoothing: scipy gaussian_filter1d, radius int(4 sigma + 0.5) */
+#define CONTACT_STEP2 0.002          /* m^2: a foot moving less than this per frame is on the ground */
+#define FRAME (SM_J * 3)
+
+static void sub(const double *a, const double *b, double *out) { for (int k = 0; k < 3; k++) out[k] = a[k] - b[k]; }
 static double len3(const double *v) { return sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
 static void unit3(double *v) { const double n = len3(v); for (int k = 0; k < 3; k++) v[k] /= n; }
 static sm_quat qconj(sm_quat q) { return (sm_quat){q.w, -q.x, -q.y, -q.z}; }
 
 /* asin x = 2 atan(x / (1 + sqrt(1 - x^2))); atan halved twice to |z| <= tan(pi/16), then its series to z^25 (error
    < 1e-19): only + - * / and sqrt, the same bits on every target */
-static double asin_(double x) {
+static double exact_asin(double x) {
     x = x > 1 ? 1 : x < -1 ? -1 : x;
-    double z = x / (1 + sqrt(1 - x * x)), s = 0;
-    z = z / (1 + sqrt(1 + z * z)), z = z / (1 + sqrt(1 + z * z));
-    for (int k = 12; k >= 0; k--) s = 1.0 / (2 * k + 1) - z * z * s;
-    return 8 * z * s;
+    double z = x / (1 + sqrt(1 - x * x));
+    z = z / (1 + sqrt(1 + z * z));
+    z = z / (1 + sqrt(1 + z * z));
+    double series = 0;
+    for (int k = 12; k >= 0; k--) series = 1.0 / (2 * k + 1) - z * z * series;
+    return 8 * z * series;
 }
 
 /* (az, 0, -ax): Y x unit(a), a = the hip line plus the shoulder line */
-static void facing(const double *p, int sign, double *f) {
+static void facing(const double *p, int sign, double *out) {
     double a[3];
-    for (int k = 0; k < 3; k++) a[k] = sign * (p[3 + k] - p[6 + k]) + (p[51 + k] - p[48 + k]);
+    for (int k = 0; k < 3; k++)
+        a[k] = sign * (p[3 * SM_L_HIP + k] - p[3 * SM_R_HIP + k]) + (p[3 * SM_R_SHOULDER + k] - p[3 * SM_L_SHOULDER + k]);
     unit3(a);
-    f[0] = a[2], f[1] = 0, f[2] = -a[0];
+    out[0] = a[2];
+    out[1] = 0;
+    out[2] = -a[0];
+}
+
+/* the right knee and ankle bones of the first frame, rounded as the reference does */
+static double right_leg_length(const float *joints) {
+    double total = 0;
+    for (int i = 0; i < 2; i++) {
+        const int j = i ? SM_R_ANKLE : SM_R_KNEE;
+        double bone[3];
+        for (int k = 0; k < 3; k++) bone[k] = (double)joints[3 * j + k] - joints[3 * sm_parent[j] + k];
+        total += (float)len3(bone);
+    }
+    return total;
 }
 
 /* the bones' directions with the target lengths, the root scaled by leg length (IK then FK onto the target skeleton) */
-static void retarget(const float *joints, uint32_t T, double *P) {
-    double d[3], src[2];
-    for (int i = 0; i < 2; i++) {   /* right knee and ankle bones of the first frame, rounded as the reference does */
-        const int j = i ? 8 : 5;
-        for (int k = 0; k < 3; k++) d[k] = (double)joints[3 * j + k] - joints[3 * sm_parent[j] + k];
-        src[i] = (float)len3(d);
-    }
-    const double scale = (target_len[5] + target_len[8]) / (src[0] + src[1]);
+static void retarget(const float *joints, uint32_t T, double *positions) {
+    const double scale = (target_len[SM_R_KNEE] + target_len[SM_R_ANKLE]) / right_leg_length(joints);
     for (size_t t = 0; t < T; t++) {
-        const float *j = joints + t * SM_J * 3;
-        double *p = P + t * SM_J * 3;
+        const float *j = joints + t * FRAME;
+        double *p = positions + t * FRAME;
         for (int k = 0; k < 3; k++) p[k] = j[k] * scale;
         for (int b = 1; b < SM_J; b++) {
             const int a = sm_parent[b];
-            for (int k = 0; k < 3; k++) d[k] = (double)j[3 * b + k] - j[3 * a + k];
-            unit3(d);
-            for (int k = 0; k < 3; k++) p[3 * b + k] = p[3 * a + k] + d[k] * target_len[b];
+            double dir[3];
+            for (int k = 0; k < 3; k++) dir[k] = (double)j[3 * b + k] - j[3 * a + k];
+            unit3(dir);
+            for (int k = 0; k < 3; k++) p[3 * b + k] = p[3 * a + k] + dir[k] * target_len[b];
         }
     }
 }
 
 /* on the floor, root at x = z = 0 and facing +Z in the first frame */
-static void canonical(double *P, uint32_t T) {
+static void canonical(double *positions, uint32_t T) {
     const size_t n = (size_t)T * SM_J;
-    double lo = INFINITY, f[3], o[3];
-    for (size_t i = 0; i < n; i++) lo = P[3 * i + 1] < lo ? P[3 * i + 1] : lo;
-    const double x0 = P[0], z0 = P[2], z[3] = {0, 0, 1};
-    for (size_t i = 0; i < n; i++) P[3 * i] -= x0, P[3 * i + 1] -= lo, P[3 * i + 2] -= z0;
-    facing(P, -1, f);
-    unit3(f);
-    const sm_quat q = sm_qbetween(f, z);
-    for (size_t i = 0; i < n; i++) sm_qrot(q, P + 3 * i, o), memcpy(P + 3 * i, o, sizeof o);
+    double floor_y = INFINITY;
+    for (size_t i = 0; i < n; i++) floor_y = positions[3 * i + 1] < floor_y ? positions[3 * i + 1] : floor_y;
+
+    const double x0 = positions[0], z0 = positions[2];
+    for (size_t i = 0; i < n; i++) {
+        positions[3 * i] -= x0;
+        positions[3 * i + 1] -= floor_y;
+        positions[3 * i + 2] -= z0;
+    }
+
+    double face[3], turned[3];
+    const double forward[3] = {0, 0, 1};
+    facing(positions, -1, face);
+    unit3(face);
+    const sm_quat q = sm_qbetween(face, forward);
+    for (size_t i = 0; i < n; i++) {
+        sm_qrot(q, positions + 3 * i, turned);
+        memcpy(positions + 3 * i, turned, sizeof turned);
+    }
 }
 
 /* the root's yaw per frame from the smoothed facing (edges repeated); frame 0 keeps no turn, as the reference */
-static void root_yaw(const double *P, uint32_t T, double *F, sm_quat *R) {
-    double w[RADIUS + 1], sum = 0;
-    for (int k = 0; k <= RADIUS; k++) w[k] = sm_exp(-0.5 / (SIGMA * SIGMA) * k * k), sum += k ? 2 * w[k] : w[k];
-    for (int k = 0; k <= RADIUS; k++) w[k] /= sum;
-    for (size_t t = 0; t < T; t++) facing(P + t * SM_J * 3, 1, F + 3 * t);
+static void root_yaw(const double *positions, uint32_t T, double *facings, sm_quat *yaw) {
+    double weight[RADIUS + 1], sum = 0;
+    for (int k = 0; k <= RADIUS; k++) {
+        weight[k] = sm_exp(-0.5 / (SIGMA * SIGMA) * k * k);
+        sum += k ? 2 * weight[k] : weight[k];
+    }
+    for (int k = 0; k <= RADIUS; k++) weight[k] /= sum;
+    for (size_t t = 0; t < T; t++) facing(positions + t * FRAME, 1, facings + 3 * t);
+
     for (int64_t t = 0; t < T; t++) {
-        double s[3], z[3] = {0, 0, 1};
-        for (int k = 0; k < 3; k++) s[k] = F[3 * t + k] * w[0];
+        double smooth[3];
+        const double forward[3] = {0, 0, 1};
+        for (int k = 0; k < 3; k++) smooth[k] = facings[3 * t + k] * weight[0];
         for (int64_t d = RADIUS; d >= 1; d--) {
             const int64_t a = t - d < 0 ? 0 : t - d, b = t + d >= T ? T - 1 : t + d;
-            for (int k = 0; k < 3; k++) s[k] += (F[3 * a + k] + F[3 * b + k]) * w[d];
+            for (int k = 0; k < 3; k++) smooth[k] += (facings[3 * a + k] + facings[3 * b + k]) * weight[d];
         }
-        unit3(s);
-        R[t] = t ? sm_qbetween(s, z) : (sm_quat){1, 0, 0, 0};
+        unit3(smooth);
+        yaw[t] = t ? sm_qbetween(smooth, forward) : (sm_quat){1, 0, 0, 0};
     }
 }
 
 /* the first two columns of the rotation matrix (Zhou et al. 2019) */
-static void cont6d(sm_quat q, float *o) {
+static void cont6d(sm_quat q, float *out) {
     const double s = 2 / (q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
     const double m[6] = {1 - s * (q.y * q.y + q.z * q.z), s * (q.x * q.y + q.z * q.w), s * (q.x * q.z - q.y * q.w),
                          s * (q.x * q.y - q.z * q.w), 1 - s * (q.x * q.x + q.z * q.z), s * (q.y * q.z + q.x * q.w)};
-    for (int i = 0; i < 6; i++) o[i] = (float)m[i];
+    for (int i = 0; i < 6; i++) out[i] = (float)m[i];
 }
 
 /* the rotations of each chain's bones relative to the rotation before (the chain's start: the root's yaw) */
@@ -111,47 +143,54 @@ static void bone_rotations(const double *p, sm_quat root, float *rot6d) {
         sm_quat rot = root;
         for (int i = 1; chains[c][i] >= 0; i++) {
             const int a = chains[c][i - 1], b = chains[c][i];
-            double d[3];
-            sub(p + 3 * b, p + 3 * a, d);
-            unit3(d);
-            const sm_quat local = sm_qmul(qconj(rot), sm_qbetween(raw[b], d));
+            double dir[3];
+            sub(p + 3 * b, p + 3 * a, dir);
+            unit3(dir);
+            const sm_quat local = sm_qmul(qconj(rot), sm_qbetween(rest_direction[b], dir));
             cont6d(local, rot6d + 6 * (b - 1));
             rot = sm_qmul(rot, local);
         }
     }
 }
 
-size_t sm_feat_tmp_doubles(uint32_t T) { return (size_t)T * (SM_J * 3 + 4 + 3); }
+/* the features of the step from frame p to frame next */
+static void frame_features(const double *p, const double *next, sm_quat yaw, sm_quat next_yaw, float *f) {
+    double step[3], local[3];
+    sub(next, p, step);
+    sm_qrot(next_yaw, step, local);
+    const sm_quat yaw_velocity = sm_qmul(next_yaw, qconj(yaw));
+    f[0] = (float)exact_asin(yaw_velocity.y);
+    f[1] = (float)local[0];
+    f[2] = (float)local[2];
+    f[3] = (float)p[1];
+
+    for (int j = 1; j < SM_J; j++) {
+        const double from_root[3] = {p[3 * j] - p[0], p[3 * j + 1], p[3 * j + 2] - p[2]};
+        sm_qrot(yaw, from_root, local);
+        for (int k = 0; k < 3; k++) f[SM_F_POS + 3 * (j - 1) + k] = (float)local[k];
+    }
+    bone_rotations(p, yaw, f + SM_F_ROT);
+    for (int j = 0; j < SM_J; j++) {
+        sub(next + 3 * j, p + 3 * j, step);
+        sm_qrot(yaw, step, local);
+        for (int k = 0; k < 3; k++) f[SM_F_VEL + 3 * j + k] = (float)local[k];
+    }
+    for (int i = 0; i < 4; i++) {
+        sub(next + 3 * feet[i], p + 3 * feet[i], step);
+        f[SM_F_CONTACT + i] = step[0] * step[0] + step[1] * step[1] + step[2] * step[2] < CONTACT_STEP2 ? 1.0f : 0.0f;
+    }
+}
+
+size_t sm_feat_tmp_doubles(uint32_t T) { return (size_t)T * (FRAME + 4 + 3); }
 
 void sm_joints_to_features(const float *joints, uint32_t T, double *tmp, float *feat) {
-    double *P = tmp, *F = P + (size_t)T * SM_J * 3;
-    sm_quat *R = (sm_quat *)(void *)(F + 3 * (size_t)T);
-    static const int feet[4] = {7, 10, 8, 11};
-    retarget(joints, T, P);
-    canonical(P, T);
-    root_yaw(P, T, F, R);
+    double *positions = tmp, *facings = positions + (size_t)T * FRAME;
+    sm_quat *yaw = (sm_quat *)(void *)(facings + 3 * (size_t)T);
+    retarget(joints, T, positions);
+    canonical(positions, T);
+    root_yaw(positions, T, facings, yaw);
     for (size_t t = 0; t + 1 < T; t++) {
-        const double *p = P + t * SM_J * 3, *n = p + SM_J * 3;
-        float *f = feat + t * SM_F;
-        double d[3], o[3];
-        sub(n, p, d);
-        sm_qrot(R[t + 1], d, o);
-        const sm_quat yv = sm_qmul(R[t + 1], qconj(R[t]));
-        f[0] = (float)asin_(yv.y), f[1] = (float)o[0], f[2] = (float)o[2], f[3] = (float)p[1];
-        for (int j = 1; j < SM_J; j++) {
-            const double c[3] = {p[3 * j] - p[0], p[3 * j + 1], p[3 * j + 2] - p[2]};
-            sm_qrot(R[t], c, o);
-            for (int k = 0; k < 3; k++) f[4 + 3 * (j - 1) + k] = (float)o[k];
-        }
-        bone_rotations(p, R[t], f + 67);
-        for (int j = 0; j < SM_J; j++) {
-            sub(n + 3 * j, p + 3 * j, d);
-            sm_qrot(R[t], d, o);
-            for (int k = 0; k < 3; k++) f[193 + 3 * j + k] = (float)o[k];
-        }
-        for (int i = 0; i < 4; i++) {
-            sub(n + 3 * feet[i], p + 3 * feet[i], d);
-            f[259 + i] = d[0] * d[0] + d[1] * d[1] + d[2] * d[2] < 0.002 ? 1.0f : 0.0f;
-        }
+        const double *p = positions + t * FRAME;
+        frame_features(p, p + FRAME, yaw[t], yaw[t + 1], feat + t * SM_F);
     }
 }

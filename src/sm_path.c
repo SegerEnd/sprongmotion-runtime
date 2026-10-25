@@ -15,7 +15,10 @@ static sm_status bad(sm_request *r, uint32_t i, int k, double v, double lo, doub
     snprintf(name, sizeof name, "path[%u].%s", i, what[k]);
     if (k || !(v >= lo && v <= hi)) return sm_fail_range(r->err, sizeof r->err, SM_E_ARG, name, v, lo, hi);
     sm_buf b = {r->err, sizeof r->err - 1, 0};
-    sm_puts(&b, name), sm_puts(&b, " = "), sm_putn(&b, v), sm_puts(&b, " is not after the time before it");
+    sm_puts(&b, name);
+    sm_puts(&b, " = ");
+    sm_putn(&b, v);
+    sm_puts(&b, " is not after the time before it");
     r->err[b.n < b.cap ? b.n : b.cap] = 0;
     return SM_E_ARG;
 }
@@ -40,13 +43,13 @@ sm_status sm_request_set_path(sm_request *r, const float *points, uint32_t n) {
     return SM_OK;
 }
 
-sm_status sm_path_check(const sm_model *m, const sm_path *p, uint32_t tokens, char *err, size_t en) {
+sm_status sm_path_check(const sm_model *m, const sm_path *p, uint32_t tokens, char *err, size_t err_len) {
     const double seconds = (double)tokens * m->frames_per_token / m->fps;
     for (uint32_t i = 0; i < p->n; i++)
         if (p->p[4 * i] > seconds + 1e-3) {
             char name[24];
             snprintf(name, sizeof name, "path[%u].t", i);
-            return sm_fail_range(err, en, SM_E_ARG, name, p->p[4 * i], 0, seconds);
+            return sm_fail_range(err, err_len, SM_E_ARG, name, p->p[4 * i], 0, seconds);
         }
     return SM_OK;
 }
@@ -57,7 +60,10 @@ void sm_root_smooth(const float *joints, uint32_t T, double fps, double *g, floa
     const double sd = SIGMA * fps;
     const int64_t last = (int64_t)T - 1;
     double w[R + 1], sum = 0;
-    for (int k = 0; k <= R; k++) w[k] = sm_exp(-0.5 * k * k / (sd * sd)), sum += k ? 2 * w[k] : w[k];
+    for (int k = 0; k <= R; k++) {
+        w[k] = sm_exp(-0.5 * k * k / (sd * sd));
+        sum += k ? 2 * w[k] : w[k];
+    }
     for (int64_t t = 0; t < T; t++)
         for (int a = 0; a < 2; a++) {
             double x = 0;
@@ -84,8 +90,13 @@ static void point(const curve *c, int64_t i, double q[2]) {
     const int64_t n = c->n;
     if (c->closed) i = (i % n + n) % n;
     const int64_t a = i < 0 ? 0 : n - 1, b = i < 0 ? 1 : n - 2;   /* outside: mirrored through the end */
-    if (i >= 0 && i < n) q[0] = c->x[i], q[1] = c->z[i];
-    else q[0] = 2 * c->x[a] - c->x[b], q[1] = 2 * c->z[a] - c->z[b];
+    if (i >= 0 && i < n) {
+        q[0] = c->x[i];
+        q[1] = c->z[i];
+        return;
+    }
+    q[0] = 2 * c->x[a] - c->x[b];
+    q[1] = 2 * c->z[a] - c->z[b];
 }
 
 static double dist(const double a[2], const double b[2]) {
@@ -118,9 +129,12 @@ typedef struct { const curve *c; uint32_t seg, k, segs; double a, len, A[2], B[2
 
 static void next_chord(cursor *q) {
     double d[2];
-    q->A[0] = q->B[0], q->A[1] = q->B[1], q->hA = q->hB;
+    q->A[0] = q->B[0];
+    q->A[1] = q->B[1];
+    q->hA = q->hB;
     eval(q->c, q->seg, (q->k + 1.0) / CHORDS, q->B, d);
-    q->hB = heading(d, q->hA), q->len = dist(q->A, q->B);
+    q->hB = heading(d, q->hA);
+    q->len = dist(q->A, q->B);
 }
 
 static void start(cursor *q, const curve *c) {
@@ -134,7 +148,10 @@ static void start(cursor *q, const curve *c) {
 static int step(cursor *q) {   /* 0 at the curve's end */
     if (q->k + 1 == CHORDS && q->seg + 1 == q->segs) return 0;
     q->a += q->len;
-    if (++q->k == CHORDS) q->k = 0, q->seg++;
+    if (++q->k == CHORDS) {
+        q->k = 0;
+        q->seg++;
+    }
     next_chord(q);
     return 1;
 }
@@ -172,63 +189,106 @@ static void root_heading(const float *joints, const double *g, uint32_t T, doubl
     for (uint32_t t = 0; t < T; t++) psi[t] = atan2(-az, ax);
 }
 
-double sm_path_warp(const sm_path *p, float *joints, uint32_t T, double fps, const double *g, int warp, double *dpsi,
-                    double *tmp) {
-    double *psi = tmp, *u = psi + T, *px = u + T, *pz = px + SM_MAX_PATH, *arc = pz + SM_MAX_PATH;
-    double *kx = arc + SM_MAX_PATH, *ky = kx + SM_MAX_PATH + 2, *km = ky + SM_MAX_PATH + 2;
-    uint32_t n = 0, idx[SM_MAX_PATH];
-    for (uint32_t i = 0; i < p->n; i++) {   /* distinct points; idx: each given point's */
-        const double x = p->p[4 * i + 1], z = p->p[4 * i + 2];
-        if (!n || fabs(x - px[n - 1]) + fabs(z - pz[n - 1]) > 1e-6) px[n] = x, pz[n] = z, n++;
-        idx[i] = n - 1;
+/* the distinct points of p; index: each given point's distinct one */
+static uint32_t distinct_points(const sm_path *p, double *x, double *z, uint32_t *index) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < p->n; i++) {
+        const double px = p->p[4 * i + 1], pz = p->p[4 * i + 2];
+        if (!n || fabs(px - x[n - 1]) + fabs(pz - z[n - 1]) > 1e-6) {
+            x[n] = px;
+            z[n] = pz;
+            n++;
+        }
+        index[i] = n - 1;
     }
-    const double e0[2] = {px[0], pz[0]}, e1[2] = {px[n - 1], pz[n - 1]};
-    const int closed = n >= 4 && dist(e0, e1) < 1e-3;
-    const curve c = {px, pz, closed ? n - 1 : n, closed};
+    return n;
+}
+
+/* arc[i]: the curve's arc length at distinct point i; returns its length */
+static double curve_arcs(const curve *c, uint32_t n, double *arc) {
     cursor q;
-    double L = 0;
-    if (n > 1) {
-        start(&q, &c);
-        do if (!q.k) arc[q.seg] = q.a;
-        while (step(&q));
-        L = arc[n - 1] = q.a + q.len;
+    start(&q, c);
+    do {
+        if (!q.k) arc[q.seg] = q.a;
+    } while (step(&q));
+    arc[n - 1] = q.a + q.len;
+    return arc[n - 1];
+}
+
+/* the smoothed root's own arc length per frame, creeping on while it stands */
+static void root_arcs(const double *g, uint32_t T, double fps, double *u) {
+    u[0] = 0;
+    for (uint32_t t = 1; t < T; t++) {
+        const double dx = g[2 * t] - g[2 * t - 2], dz = g[2 * t + 1] - g[2 * t - 1];
+        u[t] = u[t - 1] + sqrt(dx * dx + dz * dz) + CREEP / fps;
     }
-    root_heading(joints, g, T, fps, psi);
-    for (uint32_t t = 0; t < T; t++) {
-        const double d = t ? sqrt((g[2 * t] - g[2 * t - 2]) * (g[2 * t] - g[2 * t - 2]) +
-                                  (g[2 * t + 1] - g[2 * t - 1]) * (g[2 * t + 1] - g[2 * t - 1])) : 0;
-        u[t] = t ? u[t - 1] + d + CREEP / fps : 0;
-    }
+}
+
+/* knots (root arc length at the point's time, curve arc length of the point), rising, from (0, 0) to the end */
+static uint32_t timed_knots(const sm_path *p, const uint32_t *index, const double *arc, uint32_t n, const double *u,
+                            uint32_t T, double fps, double length, double *kx, double *ky) {
     uint32_t nk = 1;
     kx[0] = ky[0] = 0;
-    for (uint32_t i = 0; i < p->n; i++) {   /* timed points: (root arc length at t, curve arc length of the point) */
+    for (uint32_t i = 0; i < p->n; i++) {
         if (isnan(p->p[4 * i])) continue;
         const double f = fmin(p->p[4 * i] * fps, T - 1.0), w = f - floor(f);
         const uint32_t a = (uint32_t)f, b = a + 1 < T ? a + 1 : a;
         const double x = u[a] + w * (u[b] - u[a]);
-        if (x > kx[nk - 1]) kx[nk] = x, ky[nk++] = n > 1 ? arc[idx[i]] : 0;
+        if (x <= kx[nk - 1]) continue;
+        kx[nk] = x;
+        ky[nk++] = n > 1 ? arc[index[i]] : 0;
     }
-    if (u[T - 1] > kx[nk - 1]) kx[nk] = u[T - 1], ky[nk++] = L;
+    if (u[T - 1] > kx[nk - 1]) {
+        kx[nk] = u[T - 1];
+        ky[nk++] = length;
+    }
+    return nk;
+}
+
+/* every joint about the smoothed root g, turned by angle, onto P */
+static void move_frame(float *frame, const double g[2], const double P[2], double angle) {
+    const double cs = cos(angle), sn = sin(angle);
+    for (int k = 0; k < SM_J; k++) {
+        const double dx = frame[3 * k] - g[0], dz = frame[3 * k + 2] - g[1];
+        frame[3 * k] = (float)(P[0] + dx * cs + dz * sn);
+        frame[3 * k + 2] = (float)(P[1] - dx * sn + dz * cs);
+    }
+}
+
+double sm_path_warp(const sm_path *p, float *joints, uint32_t T, double fps, const double *g, int warp, double *yaw_added,
+                    double *tmp) {
+    double *psi = tmp, *u = psi + T, *px = u + T, *pz = px + SM_MAX_PATH, *arc = pz + SM_MAX_PATH;
+    double *kx = arc + SM_MAX_PATH, *ky = kx + SM_MAX_PATH + 2, *km = ky + SM_MAX_PATH + 2;
+    uint32_t index[SM_MAX_PATH];
+    const uint32_t n = distinct_points(p, px, pz, index);
+    const double first[2] = {px[0], pz[0]}, last[2] = {px[n - 1], pz[n - 1]};
+    const int closed = n >= 4 && dist(first, last) < 1e-3;
+    const curve c = {px, pz, closed ? n - 1 : n, closed};
+    const double length = n > 1 ? curve_arcs(&c, n, arc) : 0;
+
+    root_heading(joints, g, T, fps, psi);
+    root_arcs(g, T, fps, u);
+    const uint32_t nk = timed_knots(p, index, arc, n, u, T, fps, length, kx, ky);
     tangents(kx, ky, km, nk);
+
+    cursor q;
     if (n > 1) start(&q, &c);
     double err = 0;
-    uint32_t j = 0;
+    uint32_t knot = 0;
     for (uint32_t t = 0; t < T; t++) {
-        const double S = nk > 1 ? fmin(fmax(monotone(kx, ky, km, nk, &j, u[t]), 0), L) : 0;
-        double P[2] = {px[0], pz[0]}, th = psi[t];
+        const double S = nk > 1 ? fmin(fmax(monotone(kx, ky, km, nk, &knot, u[t]), 0), length) : 0;
+        double P[2] = {px[0], pz[0]}, heading_at = psi[t];
         if (n > 1) {
             while (S > q.a + q.len && step(&q)) {}
             const double f = q.len > 0 ? fmin(fmax((S - q.a) / q.len, 0), 1) : 0;
-            P[0] = q.A[0] + f * (q.B[0] - q.A[0]), P[1] = q.A[1] + f * (q.B[1] - q.A[1]), th = q.hA + f * (q.hB - q.hA);
+            P[0] = q.A[0] + f * (q.B[0] - q.A[0]);
+            P[1] = q.A[1] + f * (q.B[1] - q.A[1]);
+            heading_at = q.hA + f * (q.hB - q.hA);
         }
         err = fmax(err, dist(g + 2 * t, P));
         if (!warp) continue;
-        const double dp = dpsi[t] = th - psi[t], cs = cos(dp), sn = sin(dp);
-        float *f = joints + (size_t)t * SM_J * 3;
-        for (int k = 0; k < SM_J; k++) {   /* about the smoothed root, turned by dp, onto P */
-            const double dx = f[3 * k] - g[2 * t], dz = f[3 * k + 2] - g[2 * t + 1];
-            f[3 * k] = (float)(P[0] + dx * cs + dz * sn), f[3 * k + 2] = (float)(P[1] - dx * sn + dz * cs);
-        }
+        yaw_added[t] = heading_at - psi[t];
+        move_frame(joints + (size_t)t * SM_J * 3, g + 2 * t, P, yaw_added[t]);
     }
     return err;
 }

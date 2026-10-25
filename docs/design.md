@@ -46,13 +46,17 @@ decoder and the text encoder are small. So the speed work is one matrix kernel.
 
 | File | Holds |
 |---|---|
-| `src/sm_model.c` | the GGUF reader, the model loader, status names, the allocator |
+| `src/sm_gguf.c` | the GGUF reader and the CRC-32 |
+| `src/sm_model.c` | the model loader and tensor binding, status names, the allocator, file mapping |
 | `src/sm_tokenizer.c` | the CLIP tokenizer and its text cleanup |
 | `src/sm_layers.c` | the matrix kernel, layer norm, attention, transformer layers, the VQ decoder and encoder |
-| `src/sm_generator.c` | binding the text encoder and generator, their passes, sampling, exact `exp` and `log` |
-| `src/sm_context.c` | contexts: scratch memory, runs, the step API, decoding, timelines |
+| `src/sm_generator.c` | binding the text encoder and generator, and their passes |
+| `src/sm_sampling.c` | the sampling noise, top-k picks, the mask schedule, exact `exp`, `log` and float16 rounding |
+| `src/sm_context.c` | contexts: scratch memory, runs, the step API, decoding |
+| `src/sm_timeline.c` | prompt blocks on a timeline |
 | `src/sm_requests.c` | the parameter table, requests, text objects, the JSON schemas |
-| `src/sm_motion.c` | the skeleton, features to joints, rotations, foot lock, motions, BVH |
+| `src/sm_pose.c` | features to joints, rotations, the clip's skeleton, foot contacts and foot lock |
+| `src/sm_motion.c` | the motion object and BVH |
 | `src/sm_features.c` | joints to features, for the motion encoder |
 | `src/sm_path.c` | root paths and the path warp |
 | `src/sm_threads.c` | the built-in thread pool |

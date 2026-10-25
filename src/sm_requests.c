@@ -44,18 +44,20 @@ static const char API_SCHEMA[] = "{\"version\":\"1.0.0\",\"fps\":20,\"params\":[
 
 static int known(sm_param p) { return p > 0 && p < SM_N_PARAMS && P[p].name; }
 
-sm_status sm_bind_params(sm_model *m, char *err, size_t en) {
+sm_status sm_bind_params(sm_model *m, char *err, size_t err_len) {
     static const char *const part[3] = {".min", ".max", ""};
     for (sm_param p = 1; p < SM_N_PARAMS; p++) {
         double *v = m->param[p], x;   /* min, max, default */
         char key[64] = "";
-        v[0] = P[p].min, v[1] = p == SM_P_SECONDS ? (double)m->max_frames / m->fps : P[p].max, v[2] = P[p].dflt;
+        v[0] = P[p].min;
+        v[1] = p == SM_P_SECONDS ? (double)m->max_frames / m->fps : P[p].max;
+        v[2] = P[p].dflt;
         for (int i = 0; i < 3 && known(p); i++) {
             snprintf(key, sizeof key, "sprongmotion.defaults.%s%s", P[p].name, part[i]);
             if (sm_gguf_num(&m->g, key, &x)) v[i] = i == 0 ? fmax(v[0], x) : i == 1 ? fmin(v[1], x) : x;
         }
         if (!(v[0] <= v[2] && v[2] <= v[1]) || (P[p].is_int && v[2] != floor(v[2])))
-            return sm_fail_range(err, en, SM_E_FORMAT, key, v[2], v[0], v[1]);
+            return sm_fail_range(err, err_len, SM_E_FORMAT, key, v[2], v[0], v[1]);
     }
     return SM_OK;
 }
@@ -107,12 +109,16 @@ static sm_status get_value(const sm_request *r, sm_param p, const void *v, int w
 
 sm_status sm_request_get_int(const sm_request *r, sm_param p, int32_t *v) {
     const sm_status s = get_value(r, p, v, 1);
-    return s == SM_OK ? (*v = (int32_t)r->v[p], s) : s;
+    if (s != SM_OK) return s;
+    *v = (int32_t)r->v[p];
+    return SM_OK;
 }
 
 sm_status sm_request_get_float(const sm_request *r, sm_param p, double *v) {
     const sm_status s = get_value(r, p, v, 0);
-    return s == SM_OK ? (*v = r->v[p], s) : s;
+    if (s != SM_OK) return s;
+    *v = r->v[p];
+    return SM_OK;
 }
 
 /* [-+]digits[.digits], whatever the locale */
@@ -121,8 +127,13 @@ static int parse_number(const char *s, double *out) {
     int digits = 0, frac = 0;
     const int neg = *s == '-';
     for (s += *s == '-' || *s == '+'; (*s >= '0' && *s <= '9') || (*s == '.' && !frac); s++) {
-        if (*s == '.') frac = 1;
-        else v = v * 10 + (*s - '0'), scale *= frac ? 10 : 1, digits++;
+        if (*s == '.') {
+            frac = 1;
+            continue;
+        }
+        v = v * 10 + (*s - '0');
+        scale *= frac ? 10 : 1;
+        digits++;
     }
     *out = (neg ? -v : v) / scale;
     return digits && !*s;
@@ -172,7 +183,9 @@ const char *sm_request_last_error(const sm_request *r) { return r ? r->err : "re
 void sm_text_copy(sm_text *d, const sm_text *s) {
     memcpy(d->vec, s->vec, sizeof(float) * s->m->text.out.n);
     memcpy(d->words, s->words, sizeof(float) * s->W * s->m->text.d);
-    d->W = s->W, d->ready = s->ready, d->n_unknown = s->n_unknown;
+    d->W = s->W;
+    d->ready = s->ready;
+    d->n_unknown = s->n_unknown;
     memcpy(d->unknown, s->unknown, sizeof d->unknown);
 }
 
@@ -182,18 +195,21 @@ sm_status sm_request_clone(const sm_request *r, sm_request **out) {
     if (!c) return SM_E_NOMEM;
     memcpy(c, r, sizeof *c);
     c->enc = NULL;
-    if (r->enc && sm_text_create(r->m, &c->enc) != SM_OK) return sm_free(&r->m->h, c), SM_E_NOMEM;
+    if (r->enc && sm_text_create(r->m, &c->enc) != SM_OK) {
+        sm_free(&r->m->h, c);
+        return SM_E_NOMEM;
+    }
     if (r->enc) sm_text_copy(c->enc, r->enc);
     *out = c;
     return SM_OK;
 }
 
 /* at most 4096 bytes of UTF-8; a NUL only as the terminator of a len -1 text */
-sm_status sm_check_text(const char *utf8, int32_t len, size_t *n, char *err, size_t en) {
-    if (!utf8) return sm_fail(err, en, SM_E_ARG, "text is NULL");
+sm_status sm_check_text(const char *utf8, int32_t len, size_t *n, char *err, size_t err_len) {
+    if (!utf8) return sm_fail(err, err_len, SM_E_ARG, "text is NULL");
     *n = len < 0 ? strlen(utf8) : (size_t)len;
-    if (*n > SM_MAX_TEXT) return sm_fail_range(err, en, SM_E_ARG, "text bytes", (double)*n, 0, SM_MAX_TEXT);
-    return !memchr(utf8, 0, *n) && sm_utf8_valid(utf8, *n) ? SM_OK : sm_fail(err, en, SM_E_ARG, "text is not UTF-8");
+    if (*n > SM_MAX_TEXT) return sm_fail_range(err, err_len, SM_E_ARG, "text bytes", (double)*n, 0, SM_MAX_TEXT);
+    return !memchr(utf8, 0, *n) && sm_utf8_valid(utf8, *n) ? SM_OK : sm_fail(err, err_len, SM_E_ARG, "text is not UTF-8");
 }
 
 sm_status sm_request_set_text(sm_request *r, const char *utf8, int32_t len) {
@@ -201,7 +217,10 @@ sm_status sm_request_set_text(sm_request *r, const char *utf8, int32_t len) {
     size_t n;
     if (sm_check_text(utf8, len, &n, r->err, sizeof r->err) != SM_OK) return SM_E_ARG;
     memcpy(r->text, utf8, n);
-    r->text[n] = 0, r->text_len = (uint32_t)n, r->has_text = 1, r->err[0] = 0;
+    r->text[n] = 0;
+    r->text_len = (uint32_t)n;
+    r->has_text = 1;
+    r->err[0] = 0;
     return SM_OK;
 }
 
@@ -210,7 +229,8 @@ sm_status sm_request_set_text_encoded(sm_request *r, const sm_text *t) {
     if (!t || t->m != r->m || !t->ready) return rfail(r, SM_E_ARG, "text NULL, not encoded or from another model");
     if (!r->enc && sm_text_create(r->m, &r->enc) != SM_OK) return rfail(r, SM_E_NOMEM, "out of memory");
     sm_text_copy(r->enc, t);
-    r->has_text = 2, r->err[0] = 0;
+    r->has_text = 2;
+    r->err[0] = 0;
     return SM_OK;
 }
 
@@ -249,7 +269,9 @@ sm_status sm_text_create(const sm_model *m, sm_text **out) {
     sm_text *t = m && out ? sm_alloc(&m->h, sizeof *t + sizeof(float) * floats) : NULL;
     if (!t) return m && out ? SM_E_NOMEM : SM_E_ARG;
     memset(t, 0, sizeof *t);
-    t->m = m, t->vec = (float *)(t + 1), t->words = t->vec + m->text.out.n;
+    t->m = m;
+    t->vec = (float *)(t + 1);
+    t->words = t->vec + m->text.out.n;
     *out = t;
     return SM_OK;
 }
@@ -271,7 +293,9 @@ sm_status sm_text_set_vector(sm_text *t, const float *v, uint32_t dim) {
     for (uint32_t i = 0; i < dim; i++)
         if (!isfinite(v[i])) return SM_E_ARG;
     memcpy(t->vec, v, sizeof(float) * dim);
-    t->W = t->n_unknown = 0, t->unknown[0] = 0, t->ready = 1;
+    t->W = t->n_unknown = 0;
+    t->unknown[0] = 0;
+    t->ready = 1;
     return SM_OK;
 }
 
@@ -299,7 +323,10 @@ size_t sm_schema(const sm_model *m, char *buf, size_t cap) {
         for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) sm_puts(&b, keys[i]);
         const double nums[] = {p, m->param[p][0], m->param[p][1], m->param[p][2]};
         const char *sep[] = {",\"min\":", ",\"max\":", ",\"default\":", sm_param_next(p) > 0 ? "}," : "}"};
-        for (int i = 0; i < 4; i++) sm_putn(&b, nums[i]), sm_puts(&b, sep[i]);
+        for (int i = 0; i < 4; i++) {
+            sm_putn(&b, nums[i]);
+            sm_puts(&b, sep[i]);
+        }
     }
     sm_puts(&b, "]," IO_SCHEMA);
     if (buf && b.n < cap) buf[b.n] = 0;

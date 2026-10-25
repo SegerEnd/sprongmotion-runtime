@@ -8,8 +8,14 @@
 #include "../include/sm.h"
 
 enum { SM_J = 22, SM_F = 263, SM_VQ_W = 256, SM_VQ_N = 512, SM_VQ_LAYERS = 6, SM_N_PARAMS = 14 };
+enum {
+    SM_PELVIS, SM_L_HIP, SM_R_HIP, SM_SPINE1, SM_L_KNEE, SM_R_KNEE, SM_SPINE2, SM_L_ANKLE, SM_R_ANKLE, SM_SPINE3,
+    SM_L_FOOT, SM_R_FOOT, SM_NECK, SM_L_COLLAR, SM_R_COLLAR, SM_HEAD, SM_L_SHOULDER, SM_R_SHOULDER
+};
+/* where each part of a 263-d feature frame starts: root yaw velocity, xz velocity, height, then these */
+enum { SM_F_POS = 4, SM_F_ROT = 67, SM_F_VEL = 193, SM_F_CONTACT = 259 };
 
-/* GGUF v3 (sm_model.c) */
+/* GGUF v3 (sm_gguf.c) */
 enum { SM_T_F32 = 0, SM_T_Q8_0 = 8, SM_T_I32 = 26 };
 typedef struct {
     const char *name; uint32_t name_len;
@@ -22,12 +28,17 @@ typedef struct {
     sm_tensor *t; uint64_t n_t;
     const uint8_t *data; size_t data_size;
 } sm_gguf;
+uint64_t    sm_gguf_count_tensors(const void *buf, size_t size);   /* 0 if not GGUF v3 */
+int32_t     sm_gguf_open(sm_gguf *g, const void *buf, size_t size, sm_tensor *t, uint64_t max_t, char *err, size_t err_len);
+/* bytes for all string entries as NUL-terminated pairs; with dst, copies the first max into dst and kv[2 * max] */
+size_t      sm_gguf_strings(const sm_gguf *g, char *dst, const char **kv, uint32_t max, uint32_t *n);
+uint32_t    sm_crc32(const uint8_t *p, size_t n);
 /* exact name, type and dims; a dim given as 0 matches any size and is set to it */
 const void *sm_gguf_tensor(const sm_gguf *g, const char *name, uint32_t type, uint32_t nd, uint64_t *dims);
 int         sm_gguf_num(const sm_gguf *g, const char *key, double *out);   /* a finite U32, I32 or F32 value */
-int32_t     sm_fail(char *err, size_t en, int32_t status, const char *msg);
+int32_t     sm_fail(char *err, size_t err_len, int32_t status, const char *msg);
 /* "name = v is out of range lo .. hi", or "is not a whole number in" for a v in range */
-int32_t     sm_fail_range(char *err, size_t en, int32_t status, const char *name, double v, double lo, double hi);
+int32_t     sm_fail_range(char *err, size_t err_len, int32_t status, const char *name, double v, double lo, double hi);
 
 /* tokenizer (sm_tokenizer.c): CLIP BPE, ids remapped to the model's smaller vocabulary */
 #define SM_TOK_MAX_CP 4096
@@ -170,6 +181,11 @@ typedef float (*sm_noise_fn)(void *user, uint32_t step, uint32_t pos, uint32_t c
 uint32_t sm_nmask(uint32_t i, uint32_t n, uint32_t free);   /* max(1, rint(cos(t pi / 2) free)), t = i / (n - 1) */
 /* the nmask lowest scores, ties to the lower position (stable argsort) */
 void     sm_lowest(const float *score, uint32_t L, uint32_t nmask, uint8_t *mask);
+typedef struct {
+    const float *logits; uint32_t L, N; const uint8_t *rows; float temp; uint32_t top_k; sm_noise_fn noise; void *user;
+    uint32_t step; int32_t *pick; float *prob;
+} sm_picking;
+void     sm_pick_rows(const sm_par *par, const sm_picking *p);   /* sm_pick on the threads */
 /* argmax over the top-k of lg / temp + noise, first max wins; prob = softmax(lg)[pick]; tmp: N floats */
 void     sm_pick(const float *lg, uint32_t L, uint32_t N, const uint8_t *rows, float temp, uint32_t k,
                  sm_noise_fn noise, void *user, uint32_t step, int32_t *pick, float *prob, float *tmp);
@@ -192,12 +208,12 @@ struct sm_model {
 void       *sm_alloc(const sm_hooks *h, size_t size);
 void        sm_free(const sm_hooks *h, void *p);
 const void *sm_need(const sm_model *m, const char *name, uint32_t type, uint32_t nd, uint64_t *dims, char *err,
-                    size_t en);
-sm_status   sm_bind_gen(sm_model *m, char *err, size_t en);      /* no text.*: tokenizer and decoder only, layers 0 */
+                    size_t err_len);
+sm_status   sm_bind_gen(sm_model *m, char *err, size_t err_len);      /* no text.*: tokenizer and decoder only, layers 0 */
 /* sprongmotion.defaults.* within the runtime's limits */
-sm_status   sm_bind_params(sm_model *m, char *err, size_t en);
+sm_status   sm_bind_params(sm_model *m, char *err, size_t err_len);
 
-/* motion (sm_motion.c): doubles inside */
+/* poses (sm_pose.c): doubles inside */
 typedef struct { double w, x, y, z; } sm_quat;
 sm_quat sm_qmul(sm_quat a, sm_quat b);
 void    sm_qrot(sm_quat q, const double v[3], double out[3]);
@@ -207,9 +223,11 @@ typedef struct { double yaw, x, z; float vel[3]; int32_t moving; } sm_track;   /
 void sm_features_to_joints(const float *feat, uint32_t T, sm_track *tr, float *joints);   /* recover_from_ric, starting from tr */
 void sm_rotations(const float *joints, uint32_t T, const float *rest, float *xyzw);   /* [T][22][4], parent-relative */
 void sm_clip_offsets(const float *joints, const float *xyzw, uint32_t T, double *tmp, float *off);
-/* delta: T * 3. dpsi (may be NULL): the yaw a path warp added per frame; a planted foot's toe keeps the one it had at
+/* delta: T * 3. yaw_added (may be NULL): the yaw a path warp added per frame; a planted foot's toe keeps the one it had at
    touch-down */
-void sm_foot_lock(float *joints, const uint8_t *contacts, uint32_t T, double *delta, const double *dpsi);
+void sm_foot_lock(float *joints, const uint8_t *contacts, uint32_t T, double *delta, const double *yaw_added);
+/* where a foot column has no flag for 20 frames (runs), its joint is on the ground while it is low and slow */
+void sm_fill_contacts(const float *joints, uint8_t *contacts, uint32_t T, double fps);
 /* joints [T][22][3] -> features [T-1][263], the training recipe (sm_features.c); tmp: sm_feat_tmp_doubles(T) */
 size_t sm_feat_tmp_doubles(uint32_t T);
 void   sm_joints_to_features(const float *joints, uint32_t T, double *tmp, float *feat);
@@ -217,12 +235,12 @@ void   sm_joints_to_features(const float *joints, uint32_t T, double *tmp, float
 /* path (sm_path.c): points [n][4] t, x, z, heading */
 #define SM_MAX_PATH 1024
 typedef struct { float p[SM_MAX_PATH * 4]; uint32_t n; } sm_path;
-sm_status sm_path_check(const sm_model *m, const sm_path *p, uint32_t tokens, char *err, size_t en);   /* times in it */
+sm_status sm_path_check(const sm_model *m, const sm_path *p, uint32_t tokens, char *err, size_t err_len);   /* times in it */
 /* the root xz of joints [T][22][3] smoothed (g [T][2]) and its speed */
 void   sm_root_smooth(const float *joints, uint32_t T, double fps, double *g, float *speed);
-/* warp 1: the root onto the path and every joint turned with it, dpsi [T] the added yaw. Returns the largest distance
+/* warp 1: the root onto the path and every joint turned with it, yaw_added [T] the added yaw. Returns the largest distance
    of g from the path's point at its time, before the warp. tmp: 2T + 6 (SM_MAX_PATH + 2) */
-double sm_path_warp(const sm_path *p, float *joints, uint32_t T, double fps, const double *g, int warp, double *dpsi,
+double sm_path_warp(const sm_path *p, float *joints, uint32_t T, double fps, const double *g, int warp, double *yaw_added,
                     double *tmp);
 #define SM_POST_TMP(T) (8 * (size_t)(T) + 6 * (SM_MAX_PATH + 2))   /* doubles sm_motion_post needs */
 
@@ -242,8 +260,46 @@ struct sm_motion {   /* one block (mem) for feat .. contacts; off: the clip's sk
     const sm_model *m; uint32_t cap, tokens, frames; int32_t seed; sm_track end; void *mem; float path_err;
     float *feat, *joints, *rot, *root, *speed, *conf, off[SM_J * 3]; int16_t *codes; uint8_t *contacts;
 };
+#define SM_MAX_VARIANTS 16
+#define SM_MAX_RUN 512   /* tokens per run */
+#define SM_TIE 12        /* tokens a loop makes past its end as its start again, then drops: 1.2 s of the wrap seen */
+#define SM_WRAP 16       /* tokens of a loop's decode window past each end: more than the decoder's reach (15) */
+#define SM_ACTIVE "a run is active: finish or abort it first"
+#define SM_CANCELLED_MSG "cancel is set: call sm_ctx_clear_cancel"
+struct sm_ctx {
+    const sm_model *m;
+    _Atomic int cancel;
+    sm_progress_fn progress;
+    void *user;
+    void *scratch, *dec;                   /* text encoder or generator; decoder */
+    size_t n_scratch, n_dec;               /* bytes */
+    sm_tok_work *tw;
+    sm_text *text;
+    int active;
+    uint32_t n, at, L, fresh, skip, tie;   /* variants, the one running, tokens made, kept, the prefix's, the wrap's */
+    double v[SM_N_PARAMS];
+    sm_prefix pre;
+    sm_path path;
+    sm_run run;
+    sm_motion *outs[SM_MAX_VARIANTS];
+    int16_t codes[SM_MAX_RUN * SM_VQ_LAYERS];
+    float conf[SM_MAX_RUN];
+    int16_t pins[SM_MAX_RUN * SM_VQ_LAYERS];
+    char err[128];
+};
+/* sm_context.c, for sm_timeline.c */
+sm_status sm_ctx_fail(sm_ctx *c, sm_status s, const char *msg);
+sm_status sm_ctx_fail_range(sm_ctx *c, const char *name, double v, double lo, double hi);
+sm_status sm_ctx_fit(sm_ctx *c, uint32_t L, uint32_t Lw);   /* room for generating L tokens and decoding Lw */
+uint32_t  sm_tokens_of(const sm_model *m, double seconds);
+sm_status sm_ctx_encode(sm_ctx *c, const char *utf8, size_t len, sm_text *t);
+sm_status sm_ctx_decode(sm_ctx *c, const int16_t *codes, uint32_t n, const sm_prefix *pre, const double *v,
+                        const sm_path *path, sm_motion *mo);
+sm_status sm_ctx_start_run(sm_ctx *c, const double *v, uint32_t L, uint32_t tie, int32_t seed);
+sm_status sm_ctx_next_pass(sm_ctx *c);   /* SM_E_CANCELLED once cancel is set */
+sm_status sm_ctx_report(sm_ctx *c, uint32_t done, uint32_t total);   /* SM_E_CANCELLED if the callback says stop */
 void      sm_param_defaults(const sm_model *m, double *v);
-sm_status sm_check_text(const char *utf8, int32_t len, size_t *n, char *err, size_t en);
+sm_status sm_check_text(const char *utf8, int32_t len, size_t *n, char *err, size_t err_len);
 void      sm_text_copy(sm_text *dst, const sm_text *src);
 size_t    sm_schema(const sm_model *m, char *buf, size_t cap);
 sm_status sm_motion_fit(sm_motion *mo, uint32_t tokens);
