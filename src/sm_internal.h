@@ -29,7 +29,7 @@ int32_t     sm_fail(char *err, size_t en, int32_t status, const char *msg);
 /* "name = v is out of range lo .. hi", or "is not a whole number in" for a v in range */
 int32_t     sm_fail_range(char *err, size_t en, int32_t status, const char *name, double v, double lo, double hi);
 
-/* tokenizer (sm_tok.c): CLIP BPE, ids remapped to the model's smaller vocabulary */
+/* tokenizer (sm_tokenizer.c): CLIP BPE, ids remapped to the model's smaller vocabulary */
 #define SM_TOK_MAX_CP 4096
 #define SM_TOK_BYTES  256   /* symbols < 256: bytes, 256..511: bytes ending a word */
 #define SM_TOK_BASE   512   /* merge r makes symbol 512 + r */
@@ -58,7 +58,7 @@ size_t  sm_tok_words(const sm_tok *t, char *buf, uint32_t *count);
 size_t  sm_tok_unknown(const sm_tok *t, const sm_tok_work *w, const int32_t *ids, int32_t n, char *buf, size_t cap,
                        uint32_t *count);
 
-/* threads (sm_pool.c): run(user, n, fn, arg) calls fn(arg, i) for every i < n and returns when all are done */
+/* threads (sm_threads.c): run(user, n, fn, arg) calls fn(arg, i) for every i < n and returns when all are done */
 typedef struct { void (*run)(void *user, uint32_t n, sm_task_fn fn, void *arg); void *user; } sm_par;
 void  sm_par_for(const sm_par *p, uint32_t n, sm_task_fn fn, void *arg);   /* p NULL: in order on this thread */
 void *sm_pool_create(const sm_hooks *h, uint32_t threads);                  /* 0: the core count; NULL: one thread */
@@ -97,7 +97,7 @@ static inline v4 sm_load4(const float *p) { v4 v; memcpy(&v, p, 16); return v; }
 static inline void sm_store4(float *p, v4 v) { memcpy(p, &v, 16); }
 static inline float sm_sum4(v4 v) { return (v[0] + v[1]) + (v[2] + v[3]); }
 
-/* matmul (sm_nn.c): Y[M][n] = X[M][k] W^T + b, then the epilogue. W rows: k floats (F32) or k/32 blocks of
+/* matmul (sm_layers.c): Y[M][n] = X[M][k] W^T + b, then the epilogue. W rows: k floats (F32) or k/32 blocks of
    {fp16 scale, 32 int8} (Q8_0). k % 32 == 0, n % 16 == 0. Bit-identical to the naive k-order loop of the same build.
    p: the weights dequantized at load as [n / 16][k][16] (NULL: dequantized a panel at a time) */
 #define SM_Q8_BLOCK 34
@@ -108,7 +108,7 @@ void  sm_row(const sm_lin *table, uint32_t i, float *out);   /* row i of a [n][k
 void  sm_pack(sm_lin *l, float *p);   /* p: k * n floats */
 void  sm_linear(const sm_par *par, const sm_lin *l, const float *X, uint32_t M, float *Y, sm_epi epi, const float *add);
 
-/* transformer layers (sm_nn.c). Rows are [M][d]; a pass holds several independent sequences (segments). */
+/* transformer layers (sm_layers.c). Rows are [M][d]; a pass holds several independent sequences (segments). */
 #define SM_MAX_LAYERS 8
 #define SM_MAX_SEGS   2
 typedef struct { const float *w, *b; } sm_norm;
@@ -120,7 +120,7 @@ size_t sm_layer_scratch_floats(uint32_t M, uint32_t d, uint32_t ff, uint32_t hea
 void   sm_layer_post(const sm_par *par, const sm_layer *l, const sm_batch *b, uint32_t heads, float *x, float *scratch);
 void   sm_layer_pre(const sm_par *par, const sm_layer *l, const sm_batch *b, uint32_t heads, float *x, float *scratch);
 
-/* VQ decoder and encoder (sm_nn.c): codes [L][6] <-> features [2L][263] (MoMask RVQ-VAE) */
+/* VQ decoder and encoder (sm_layers.c): codes [L][6] <-> features [2L][263] (MoMask RVQ-VAE) */
 typedef struct { const float *w, *b; } sm_conv;  /* w: [k][in][out] */
 typedef struct { sm_conv in, down, res1[3], res2[3], out; } sm_vq_enc;
 typedef struct {
@@ -133,7 +133,7 @@ void   sm_vq_decode(const sm_vq *v, const int16_t *codes, uint32_t L, float *fea
 size_t sm_vq_enc_scratch_floats(uint32_t T);
 void   sm_vq_encode(const sm_vq *v, const float *feat, uint32_t T, int16_t *codes, float *scratch);
 
-/* text encoder, generator and sampler (sm_gen.c) */
+/* text encoder, generator and sampler (sm_generator.c) */
 typedef struct {
     sm_lin emb, emb_up, out; const float *pos; sm_layer L[SM_MAX_LAYERS]; sm_norm ln;
     uint32_t layers, d, heads, max_len; const sm_par *par;
@@ -210,7 +210,7 @@ void sm_clip_offsets(const float *joints, const float *xyzw, uint32_t T, double 
 /* delta: T * 3. dpsi (may be NULL): the yaw a path warp added per frame; a planted foot's toe keeps the one it had at
    touch-down */
 void sm_foot_lock(float *joints, const uint8_t *contacts, uint32_t T, double *delta, const double *dpsi);
-/* joints [T][22][3] -> features [T-1][263], the training recipe (sm_feat.c); tmp: sm_feat_tmp_doubles(T) */
+/* joints [T][22][3] -> features [T-1][263], the training recipe (sm_features.c); tmp: sm_feat_tmp_doubles(T) */
 size_t sm_feat_tmp_doubles(uint32_t T);
 void   sm_joints_to_features(const float *joints, uint32_t T, double *tmp, float *feat);
 
@@ -226,7 +226,7 @@ double sm_path_warp(const sm_path *p, float *joints, uint32_t T, double fps, con
                     double *tmp);
 #define SM_POST_TMP(T) (8 * (size_t)(T) + 6 * (SM_MAX_PATH + 2))   /* doubles sm_motion_post needs */
 
-/* public objects (sm_api.c, sm_run.c, sm_motion.c) */
+/* public objects (sm_requests.c, sm_context.c, sm_motion.c) */
 #define SM_MAX_TEXT   4096
 #define SM_OVERLAP    3    /* tokens of a prefix clip the new one starts from */
 #define SM_CONTEXT    8    /* tokens of a prefix clip the decoder sees */

@@ -42,6 +42,22 @@ the gate with SprongMotion-14M 1.0 (the tests print the numbers).
 Where the work is: the generator's four matrix products per layer are about 90 % of the time. Attention, the heads, the
 decoder and the text encoder are small. So the speed work is one matrix kernel.
 
+## Source files
+
+| File | Holds |
+|---|---|
+| `src/sm_model.c` | the GGUF reader, the model loader, status names, the allocator |
+| `src/sm_tokenizer.c` | the CLIP tokenizer and its text cleanup |
+| `src/sm_layers.c` | the matrix kernel, layer norm, attention, transformer layers, the VQ decoder and encoder |
+| `src/sm_generator.c` | binding the text encoder and generator, their passes, sampling, exact `exp` and `log` |
+| `src/sm_context.c` | contexts: scratch memory, runs, the step API, decoding, timelines |
+| `src/sm_requests.c` | the parameter table, requests, text objects, the JSON schemas |
+| `src/sm_motion.c` | the skeleton, features to joints, rotations, foot lock, motions, BVH |
+| `src/sm_features.c` | joints to features, for the motion encoder |
+| `src/sm_path.c` | root paths and the path warp |
+| `src/sm_threads.c` | the built-in thread pool |
+| `src/sm_internal.h` | the types and functions shared between them |
+
 ## Model file
 
 The model is a GGUF v3 file (https://github.com/ggml-org/ggml/blob/master/docs/gguf.md): little-endian, a key-value
