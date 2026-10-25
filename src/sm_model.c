@@ -119,7 +119,23 @@ void sm_dealloc(const sm_hooks *h, void *p) {
 #endif
 }
 
-void sm_free(void *ptr) { sm_dealloc(&settings, ptr); }
+// Memory handed to the caller keeps the free function it was made with in front of it, for sm_free.
+typedef struct { void (*free)(void *ptr); } caller_header;
+#define CALLER_HEADER_SIZE ALIGN
+
+void *sm_alloc_for_caller(const sm_hooks *h, size_t size) {
+    char *base = sm_alloc(h, CALLER_HEADER_SIZE + size);
+    if (!base) return NULL;
+    ((caller_header *)base)->free = h->free;
+    return base + CALLER_HEADER_SIZE;
+}
+
+void sm_free(void *ptr) {
+    if (!ptr) return;
+    char *base = (char *)ptr - CALLER_HEADER_SIZE;
+    const sm_hooks h = {.free = ((caller_header *)base)->free};
+    sm_dealloc(&h, base);
+}
 
 typedef struct { sm_job_fn fn; void *arg; } job;
 

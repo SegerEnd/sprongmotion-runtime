@@ -173,7 +173,9 @@ static void test_decode(sm_model m) {
     printf("bvh: %zu bytes, %d lines\n", strlen(bvh), lines);
     CHECK(!sm_export_motion_bvh_text(mo, 0) && failed_with("scale"));
     CHECK(!sm_export_motion_bvh(mo, "/nonexistent/dir/x.bvh") && failed_with("cannot write"));
+    sm_set_memory_functions(NULL, NULL);  // the text still goes back to the functions it was made with
     sm_free(bvh);
+    sm_set_memory_functions(count_alloc, count_free);
     sm_unload_motion(mo);
 }
 

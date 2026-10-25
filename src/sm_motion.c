@@ -202,7 +202,7 @@ char *sm_export_motion_bvh_text(sm_motion motion, float scale) {
     }
     sm_buf b = {NULL, 0, 0};
     write_bvh(mo, scale, &b);
-    char *text = sm_alloc(sm_settings(), b.n + 1);
+    char *text = sm_alloc_for_caller(&mo->m->h, b.n + 1);
     if (!text) {
         sm_set_error("out of memory");
         return NULL;

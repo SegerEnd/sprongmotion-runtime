@@ -236,6 +236,7 @@ struct sm_model_impl {
 };
 void       *sm_alloc(const sm_hooks *h, size_t size);
 void        sm_dealloc(const sm_hooks *h, void *p);
+void       *sm_alloc_for_caller(const sm_hooks *h, size_t size);   /* freed with sm_free */
 const void *sm_need(const sm_model_impl *m, const char *name, uint32_t type, uint32_t nd, uint64_t *dims, char *err,
                     size_t err_len);
 sm_status   sm_load(const void *bytes, size_t size, uint32_t flags, sm_model_impl **out, char *err, size_t err_len);
