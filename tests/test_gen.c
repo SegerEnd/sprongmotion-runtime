@@ -5,28 +5,13 @@
 #include <string.h>
 #include <time.h>
 
-typedef struct { char name[64]; uint32_t nd, dim[4]; size_t n; float *data; } arr;
-static arr A[256]; static uint32_t nA;
 static const uint32_t LENS[4] = {1, 17, 49, 100};
 #define N_PROMPTS 10
 
-static const arr *find(const char *fmt, int i, int j) {
-    char name[64]; snprintf(name, sizeof name, fmt, i, j);
-    for (uint32_t k = 0; k < nA; k++) if (!strcmp(A[k].name, name)) return &A[k];
-    fprintf(stderr, "missing %s\n", name); exit(2);
-}
-
-static int load_golden(const char *path) {
-    FILE *f = fopen(path, "rb"); if (!f) return 0;
-    int ok = fread(&nA, 4, 1, f) == 1 && nA <= 256;
-    for (uint32_t i = 0; ok && i < nA; i++) {
-        uint32_t len; arr *a = &A[i]; a->n = 1;
-        ok = fread(&len, 4, 1, f) == 1 && len < 64 && fread(a->name, 1, len, f) == len;
-        ok = ok && fread(&a->nd, 4, 1, f) == 1 && a->nd <= 4 && fread(a->dim, 4, a->nd, f) == a->nd;
-        for (uint32_t d = 0; ok && d < a->nd; d++) a->n *= a->dim[d];
-        ok = ok && (a->data = malloc(sizeof(float) * a->n)) && fread(a->data, sizeof(float), a->n, f) == a->n;
-    }
-    fclose(f); return ok;
+static const golden *find(const char *fmt, int i, int j) {
+    char name[64];
+    snprintf(name, sizeof name, fmt, i, j);
+    return find_golden(name);
 }
 
 static sm_model *load_model(const char *var, uint32_t threads) {
@@ -39,7 +24,7 @@ static sm_model *load_model(const char *var, uint32_t threads) {
 }
 
 static int32_t *ids_of(int p, uint32_t *W) {
-    const arr *a = find("p%d.ids", p, 0); int32_t *ids = malloc(sizeof(int32_t) * a->n);
+    const golden *a = find("p%d.ids", p, 0); int32_t *ids = malloc(sizeof(int32_t) * a->n);
     for (size_t i = 0; i < a->n; i++) ids[i] = (int32_t)a->data[i];
     *W = (uint32_t)a->n; return ids;
 }
@@ -85,7 +70,7 @@ static void hist_of(const sm_gen *g, const float *codes, uint32_t L, uint32_t q,
 }
 
 static void test_noise(void) {
-    const arr *a = find("noise", 0, 0); const sm_sampling s = sampling(); size_t exact = 0; double worst = 0;
+    const golden *a = find("noise", 0, 0); const sm_sampling s = sampling(); size_t exact = 0; double worst = 0;
     for (uint32_t t = 0; t < a->dim[0]; t++)
         for (uint32_t j = 0; j < a->dim[1]; j++)
             for (uint32_t c = 0; c < a->dim[2]; c++) {
@@ -321,7 +306,7 @@ static void test_threads(int speed) {
 }
 
 int main(void) {
-    CHECK(load_golden("tests/data/gen_golden.bin")); if (!nA) return CHECK_DONE();
+    CHECK(load_goldens("tests/data/gen_golden.bin")); if (!n_goldens) return CHECK_DONE();
     test_noise();
     sm_model *f32 = load_model("SM_GOLDEN_F32", 0), *q8 = load_model("SM_GOLDEN_Q8", 0);
     if (!f32 || !q8) printf("test_gen: no $SM_GOLDEN_F32 and $SM_GOLDEN_Q8, generator tests skipped\n");
@@ -330,6 +315,6 @@ int main(void) {
     if (f32 && q8) test_q8(q8, (const clip *)codes);
     sm_model_free(f32); sm_model_free(q8); free(codes);
     if (f32 && q8) test_threads(MAX_L == 100);
-    for (uint32_t i = 0; i < nA; i++) free(A[i].data);
+    free_goldens();
     return CHECK_DONE();
 }

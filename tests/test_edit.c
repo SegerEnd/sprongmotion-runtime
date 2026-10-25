@@ -10,8 +10,7 @@ static void add(list *l, double x) {
     if (l->n == l->cap) l->v = realloc(l->v, sizeof(double) * (l->cap = l->cap ? 2 * l->cap : 256));
     l->v[l->n++] = x;
 }
-static int cmp(const void *a, const void *b) { const double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
-static double pct(list *l, double p) { qsort(l->v, l->n, sizeof(double), cmp); return l->n ? l->v[(size_t)(p * (double)(l->n - 1))] : 0; }
+static double pct(list *l, double p) { qsort(l->v, l->n, sizeof(double), cmp_double); return l->n ? l->v[(size_t)(p * (double)(l->n - 1))] : 0; }
 static double mean(const list *l) { double s = 0; for (size_t i = 0; i < l->n; i++) s += l->v[i]; return l->n ? s / (double)l->n : 0; }
 
 /* seam vs inside: jerk of the local pose (the features' joints relative to the root in its heading frame, m/s^3, mean

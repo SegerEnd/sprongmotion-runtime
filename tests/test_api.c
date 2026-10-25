@@ -393,7 +393,6 @@ static void test_no_alloc(const sm_model *m) {
     sm_request_free(r); sm_ctx_free(c);
 }
 
-static int cmp(const void *a, const void *b) { const double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
 
 /* chained clips (2 s, then 1 s segments, each from the last 0.3 s of the one before): acceleration at the seams vs
    inside, for the segments' own joints played one after another and for all their codes decoded at once */
@@ -430,7 +429,7 @@ static void test_seams(const sm_model *m) {
     }
     double med[2][2];
     for (int w = 0; w < 2; w++)
-        for (int at = 0; at < 2; at++) qsort(acc[w][at], idx[w][at], sizeof(double), cmp), med[w][at] = acc[w][at][idx[w][at] / 2];
+        for (int at = 0; at < 2; at++) qsort(acc[w][at], idx[w][at], sizeof(double), cmp_double), med[w][at] = acc[w][at][idx[w][at] / 2];
     printf("seams (1 s segments, median acceleration, m/s^2): one decode %.2f at seams vs %.2f inside; own joints %.2f vs %.2f\n",
            med[1][1], med[1][0], med[0][1], med[0][0]);
     CHECK(med[1][1] < 1.25 * med[1][0] && med[0][1] < 2 * med[0][0]);

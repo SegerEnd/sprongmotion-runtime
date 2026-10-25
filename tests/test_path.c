@@ -81,7 +81,6 @@ static void test_golden(const sm_model *m) {
     sm_motion_free(mo); sm_ctx_free(c); sm_request_free(r);
 }
 
-static double rnd(unsigned *s) { *s = *s * 1103515245u + 12345u; return ((*s >> 8) & 0xFFFF) / 65535.0; }
 
 /* random, duplicate, collinear, closed, far and timed points: always a finite motion */
 static void test_fuzz(const sm_model *m) {
@@ -263,7 +262,6 @@ static double slide(const float *base, const float *j, uint32_t T, int toe) {
     return n ? s / n : 0;
 }
 
-static int cmpd(const void *a, const void *b) { const double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
 
 static void jerk(const float *j, uint32_t T, double *med, double *p95) {   /* world joints, mean over joints, m/s^3 */
     static double v[4000];
@@ -279,7 +277,7 @@ static void jerk(const float *j, uint32_t T, double *med, double *p95) {   /* wo
         }
         v[t] = s / 22 * 8000;
     }
-    qsort(v, T - 3, sizeof(double), cmpd);
+    qsort(v, T - 3, sizeof(double), cmp_double);
     *med = v[(T - 4) / 2], *p95 = v[(size_t)(0.95 * (T - 4))];
 }
 

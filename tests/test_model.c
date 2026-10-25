@@ -4,6 +4,7 @@
 #include "check.h"
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static uint8_t *read_all(const char *path, size_t *n) {
     FILE *f = fopen(path, "rb"); if (!f) return NULL;
@@ -32,28 +33,35 @@ static void test_tokenizer(const sm_model *m, const char *path) {
     free(w); free(b);
 }
 
-static void test_decoder(const sm_model *m, const char *path) {  /* codes_i / feat_i arrays of vq_golden.bin */
-    size_t n; uint8_t *b = read_all(path, &n); CHECK(b != NULL); if (!b) return;
-    uint32_t na; memcpy(&na, b, 4); size_t at = 4; const float *codes = NULL; uint32_t L = 0; double worst = 0; int pairs = 0;
-    for (uint32_t i = 0; i < na; i++) {
-        uint32_t len, nd, dim[4]; size_t elems = 1; char name[64] = {0};
-        memcpy(&len, b + at, 4); memcpy(name, b + at + 4, len < 63 ? len : 63); at += 4 + len;
-        memcpy(&nd, b + at, 4); memcpy(dim, b + at + 4, 4 * nd); at += 4 + 4 * nd;
-        for (uint32_t d = 0; d < nd; d++) elems *= dim[d];
-        float *data = malloc(4 * elems); memcpy(data, b + at, 4 * elems); at += 4 * elems;   /* aligned copy (the file packs arrays) */
-        if (!strncmp(name, "codes_", 6)) { free((void *)codes); codes = data; L = dim[0]; data = NULL; }
-        if (!strncmp(name, "feat_", 5) && codes) {
-            int16_t *c = malloc(sizeof(int16_t) * 6 * L); float *f = malloc(sizeof(float) * 2 * L * SM_F), *s = malloc(sizeof(float) * sm_vq_scratch_floats(L));
-            for (uint32_t k = 0; k < 6 * L; k++) c[k] = (int16_t)codes[k];
-            sm_vq_decode(&m->vq, c, L, f, s);
-            for (size_t k = 0; k < (size_t)2 * L * SM_F; k++) worst = fmax(worst, fabs(f[k] - data[k]) / (fabs(data[k]) + 1));
-            free(c); free(f); free(s); pairs++;
-        }
-        free(data);
+/* the codes_i and feat_i arrays of vq_golden.bin, through the loaded file; the time on one thread */
+static void test_decoder(const sm_model *m, const char *path) {
+    CHECK(load_goldens(path));
+    double worst = 0, secs = 0;
+    uint32_t frames = 0;
+    for (int i = 0; i < 6; i++) {
+        char name[32];
+        snprintf(name, sizeof name, "codes_%d", i);
+        const golden *c = find_golden(name);
+        snprintf(name, sizeof name, "feat_%d", i);
+        const golden *want = find_golden(name);
+        const uint32_t L = c->dim[0];
+        int16_t *codes = malloc(sizeof(int16_t) * L * 6);
+        float *feat = malloc(sizeof(float) * 2 * L * SM_F), *scratch = malloc(sizeof(float) * sm_vq_scratch_floats(L));
+        for (uint32_t k = 0; k < L * 6; k++) codes[k] = (int16_t)c->data[k];
+        const clock_t t0 = clock();
+        sm_vq_decode(&m->vq, codes, L, feat, scratch);
+        secs += (double)(clock() - t0) / CLOCKS_PER_SEC;
+        frames += 2 * L;
+        CHECK(want->dim[0] == 2 * L);
+        for (size_t k = 0; k < (size_t)2 * L * SM_F; k++)
+            worst = fmax(worst, fabs(feat[k] - want->data[k]) / (fabs(want->data[k]) + 1));
+        free(codes);
+        free(feat);
+        free(scratch);
     }
-    free((void *)codes);
-    printf("decoder via the model file: %d clips, max rel diff %.2e\n", pairs, worst);
-    CHECK(pairs == 6); NEAR(worst, 0, 2e-5); free(b);
+    printf("decoder: max rel diff %.2e, %.2f ms per 10 s clip (1 thread)\n", worst, secs / frames * 200 * 1000);
+    NEAR(worst, 0, 2e-5);
+    free_goldens();
 }
 
 static void test_corrupt(const uint8_t *file, size_t n) {  /* any damage: an error status or a valid model, never a crash */

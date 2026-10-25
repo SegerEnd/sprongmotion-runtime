@@ -4,9 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-static double rnd(unsigned *s) { *s = *s * 1103515245u + 12345u; return ((*s >> 8) & 0xFFFF) / 65535.0 * 2 - 1; }
 static void rand_unit(unsigned *s, double v[3]) {
-    double n; do { v[0] = rnd(s); v[1] = rnd(s); v[2] = rnd(s); n = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); } while (n < 0.1);
+    double n; do { v[0] = rnd(s) * 2 - 1; v[1] = rnd(s) * 2 - 1; v[2] = rnd(s) * 2 - 1; n = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); } while (n < 0.1);
     v[0] /= n; v[1] /= n; v[2] /= n;
 }
 
