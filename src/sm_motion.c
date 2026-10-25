@@ -1,27 +1,20 @@
-/* The skeleton's names, the motion object and BVH text. */
+/* Motions and BVH text. */
 #include "sm_internal.h"
 
-static const char *const joint_names[SM_J] = {
+const char *const sm_joint_names[SM_J] = {
     "pelvis", "l_hip", "r_hip", "spine1", "l_knee", "r_knee", "spine2", "l_ankle", "r_ankle", "spine3", "l_foot",
     "r_foot", "neck", "l_collar", "r_collar", "head", "l_shoulder", "r_shoulder", "l_elbow", "r_elbow", "l_wrist",
     "r_wrist",
 };
 
-const char *sm_skeleton_joint_name(const sm_model *m, uint32_t j) { return m && j < SM_J ? joint_names[j] : NULL; }
-int32_t sm_skeleton_parent(const sm_model *m, uint32_t j) { return m && j < SM_J ? sm_parent[j] : -1; }
-
-sm_status sm_skeleton_offsets(const sm_model *m, float *out, uint32_t n_floats) {
-    if (!m || !out) return SM_E_ARG;
-    if (n_floats < SM_J * 3) return SM_E_BUFFER;
-    memcpy(out, m->rest, sizeof(float) * SM_J * 3);
-    return SM_OK;
-}
-
 #define MAX_TOKENS 6000   /* 10 minutes */
+#ifdef __wasm32__
+_Static_assert(sizeof(sm_model) == 52 && sizeof(sm_motion) == 68, "examples/05_wasm.mjs reads these sizes");
+#endif
 
-sm_status sm_motion_create(const sm_model *m, sm_motion **out) {
-    sm_motion *mo = m && out ? sm_alloc(&m->h, sizeof *mo) : NULL;
-    if (!mo) return m && out ? SM_E_NOMEM : SM_E_ARG;
+sm_status sm_motion_create(const sm_model_impl *m, sm_motion_impl **out) {
+    sm_motion_impl *mo = sm_alloc(&m->h, sizeof *mo);
+    if (!mo) return SM_E_NOMEM;
     memset(mo, 0, sizeof *mo);
     mo->m = m;
     mo->seed = -1;
@@ -29,20 +22,21 @@ sm_status sm_motion_create(const sm_model *m, sm_motion **out) {
     return SM_OK;
 }
 
-void sm_motion_free(sm_motion *mo) {
+void sm_motion_free(sm_motion_impl *mo) {
     if (!mo) return;
-    sm_free(&mo->m->h, mo->mem);
-    sm_free(&mo->m->h, mo);
+    sm_dealloc(&mo->m->h, mo->block_starts);
+    sm_dealloc(&mo->m->h, mo->mem);
+    sm_dealloc(&mo->m->h, mo);
 }
 
 /* one block per capacity; the floats first, then codes, then contacts */
-sm_status sm_motion_fit(sm_motion *mo, uint32_t tokens) {
+sm_status sm_motion_fit(sm_motion_impl *mo, uint32_t tokens) {
     if (tokens <= mo->cap) return SM_OK;
     if (tokens > MAX_TOKENS) return SM_E_ARG;
     const size_t T = 2 * (size_t)tokens, floats = T * (SM_F + SM_J * 3 + SM_J * 4 + 4) + tokens;
     float *f = sm_alloc(&mo->m->h, sizeof(float) * floats + sizeof(int16_t) * tokens * SM_VQ_LAYERS + T * 4);
     if (!f) return SM_E_NOMEM;
-    sm_free(&mo->m->h, mo->mem);
+    sm_dealloc(&mo->m->h, mo->mem);
     mo->mem = mo->feat = f;
     mo->joints = mo->feat + T * SM_F;
     mo->rot = mo->joints + T * SM_J * 3;
@@ -56,68 +50,28 @@ sm_status sm_motion_fit(sm_motion *mo, uint32_t tokens) {
     return SM_OK;
 }
 
-sm_status sm_motion_reserve(sm_motion *mo, double max_seconds) {
-    if (!mo || !(max_seconds > 0 && max_seconds <= MAX_TOKENS * 0.1)) return SM_E_ARG;
-    const double per_token = (double)mo->m->frames_per_token / mo->m->fps;
-    return sm_motion_fit(mo, (uint32_t)ceil(max_seconds / per_token - 1e-9));
+sm_motion sm_wrap_motion(sm_motion_impl *mo) {
+    if (!mo) return (sm_motion){0};
+    return (sm_motion){
+        .frame_count = (int)mo->frames, .fps = (int)mo->m->fps, .seed = mo->seed, .joints = mo->joints,
+        .rotations = mo->rot, .offsets = mo->off, .root = mo->root, .speed = mo->speed, .contacts = mo->contacts,
+        .features = mo->feat, .codes = mo->codes, .confidence = mo->conf, .token_count = (int)mo->tokens,
+        .path_error = mo->path_err, .block_start_frames = mo->block_starts, .block_count = (int)mo->n_blocks,
+        .internal = mo,
+    };
 }
 
-sm_status sm_motion_copy(sm_motion *dst, const sm_motion *src) {
-    if (!dst || !src || dst->m != src->m) return SM_E_ARG;
-    if (dst == src) return SM_OK;
-    const sm_status s = sm_motion_fit(dst, src->tokens);
-    if (s != SM_OK) return s;
-    const size_t T = src->frames, L = src->tokens;
-    memcpy(dst->feat, src->feat, sizeof(float) * T * SM_F);
-    memcpy(dst->joints, src->joints, sizeof(float) * T * SM_J * 3);
-    memcpy(dst->rot, src->rot, sizeof(float) * T * SM_J * 4);
-    memcpy(dst->root, src->root, sizeof(float) * T * 3);
-    memcpy(dst->speed, src->speed, sizeof(float) * T);
-    memcpy(dst->conf, src->conf, sizeof(float) * L);
-    memcpy(dst->codes, src->codes, sizeof(int16_t) * L * SM_VQ_LAYERS);
-    memcpy(dst->contacts, src->contacts, T * 4);
-    memcpy(dst->off, src->off, sizeof dst->off);
-    dst->tokens = src->tokens;
-    dst->frames = src->frames;
-    dst->seed = src->seed;
-    dst->end = src->end;
-    dst->path_err = src->path_err;
-    return SM_OK;
-}
+bool sm_is_motion_valid(sm_motion motion) { return motion.internal != NULL; }
+void sm_unload_motion(sm_motion motion) { sm_motion_free(motion.internal); }
 
-double   sm_motion_seconds(const sm_motion *mo) { return mo ? (double)mo->frames / mo->m->fps : 0; }
-uint32_t sm_motion_frames(const sm_motion *mo) { return mo ? mo->frames : 0; }
-int32_t  sm_motion_seed(const sm_motion *mo) { return mo ? mo->seed : -1; }
-
-static const void *view(const sm_motion *mo, const void *p, size_t per_frame, size_t per_token, uint32_t *n) {
-    const size_t count = mo ? mo->frames * per_frame + mo->tokens * per_token : 0;
-    if (n) *n = (uint32_t)count;
-    return count ? p : NULL;
-}
-
-const float *sm_motion_joints(const sm_motion *mo, uint32_t *n) { return view(mo, mo ? mo->joints : 0, 66, 0, n); }
-const float *sm_motion_rotations(const sm_motion *mo, uint32_t *n) { return view(mo, mo ? mo->rot : 0, 88, 0, n); }
-const float *sm_motion_root(const sm_motion *mo, uint32_t *n) { return view(mo, mo ? mo->root : 0, 3, 0, n); }
-const float *sm_motion_speed(const sm_motion *mo, uint32_t *n) { return view(mo, mo ? mo->speed : 0, 1, 0, n); }
-float sm_motion_path_error(const sm_motion *mo) { return mo && mo->frames ? mo->path_err : -1; }
-const uint8_t *sm_motion_contacts(const sm_motion *mo, uint32_t *n) { return view(mo, mo ? mo->contacts : 0, 4, 0, n); }
-const float *sm_motion_features(const sm_motion *mo, uint32_t *n) { return view(mo, mo ? mo->feat : 0, SM_F, 0, n); }
-const int16_t *sm_motion_codes(const sm_motion *mo, uint32_t *n) { return view(mo, mo ? mo->codes : 0, 0, 6, n); }
-const float *sm_motion_confidence(const sm_motion *mo, uint32_t *n) { return view(mo, mo ? mo->conf : 0, 0, 1, n); }
-
-const float *sm_motion_offsets(const sm_motion *mo, uint32_t *n) {
-    if (n) *n = mo && mo->frames ? SM_J * 3 : 0;
-    return mo && mo->frames ? mo->off : NULL;
-}
-
-static void remove_travel(sm_motion *mo) {
+static void remove_travel(sm_motion_impl *mo) {
     for (size_t i = 0; i < (size_t)mo->frames * SM_J; i++) {
         mo->joints[3 * i] -= mo->root[3 * (i / SM_J)];
         mo->joints[3 * i + 2] -= mo->root[3 * (i / SM_J) + 2];
     }
 }
 
-void sm_motion_post(sm_motion *mo, const sm_track *tr, const double *v, const sm_path *path, double *tmp) {
+void sm_motion_post(sm_motion_impl *mo, const sm_track *tr, const double *v, const sm_path *path, double *tmp) {
     const uint32_t T = mo->frames;
     const double fps = mo->m->fps;
     double *yaw_added = tmp + 3 * (size_t)T, *smooth_root = yaw_added + T;
@@ -176,7 +130,7 @@ static void line(sm_buf *b, int depth, const char *s) {
     sm_puts(b, s);
 }
 
-static void hierarchy(const sm_motion *mo, double scale, sm_buf *b) {
+static void hierarchy(const sm_motion_impl *mo, double scale, sm_buf *b) {
     int depth[SM_J], open = 0;
     sm_puts(b, "HIERARCHY\n");
     for (int i = 0; i < SM_J; i++) {
@@ -184,7 +138,7 @@ static void hierarchy(const sm_motion *mo, double scale, sm_buf *b) {
         depth[j] = j ? depth[sm_parent[j]] + 1 : 0;
         for (; open > depth[j]; open--) line(b, open - 1, "}\n");
         line(b, depth[j], j ? "JOINT " : "ROOT ");
-        sm_puts(b, joint_names[j]);
+        sm_puts(b, sm_joint_names[j]);
         sm_puts(b, "\n");
         line(b, depth[j], "{\n");
         line(b, depth[j] + 1, "OFFSET");
@@ -210,7 +164,7 @@ static void euler_zyx(const float *q, double *e) {
     for (int k = 0; k < 3; k++) e[k] = next[k] + 360 * round((e[k] - next[k]) / 360);
 }
 
-static void frames(const sm_motion *mo, double scale, sm_buf *b) {
+static void frames(const sm_motion_impl *mo, double scale, sm_buf *b) {
     double angles[SM_J][3] = {{0}};
     sm_puts(b, "MOTION\nFrames: ");
     sm_putn(b, mo->frames);
@@ -234,17 +188,39 @@ static void frames(const sm_motion *mo, double scale, sm_buf *b) {
     sm_puts(b, "\n");
 }
 
-sm_status sm_motion_write_bvh(const sm_motion *mo, double scale, char *buf, size_t cap, size_t *needed) {
-    if (!mo || !(scale > 0 && scale <= 1e4) || (!buf && !needed)) return SM_E_ARG;
-    if (!mo->frames) return SM_E_STATE;
-    sm_buf b = {NULL, 0, 0};
-    for (int pass = 0; pass < 2; pass++) {
-        hierarchy(mo, scale, &b);
-        frames(mo, scale, &b);
-        if (!pass && needed) *needed = b.n + 1;
-        if (!pass && (!buf || cap < b.n + 1)) return buf ? SM_E_BUFFER : SM_OK;
-        if (!pass) b = (sm_buf){buf, cap, 0};
+static void write_bvh(const sm_motion_impl *mo, double scale, sm_buf *b) {
+    hierarchy(mo, scale, b);
+    frames(mo, scale, b);
+}
+
+char *sm_export_motion_bvh_text(sm_motion motion, float scale) {
+    const sm_motion_impl *mo = motion.internal;
+    if (!sm_check_input(mo, "the motion is empty")) return NULL;
+    if (!(scale > 0 && scale <= 1e4f)) {
+        sm_set_error("scale is not in 0 .. 10000");
+        return NULL;
     }
-    buf[b.n] = 0;
-    return SM_OK;
+    sm_buf b = {NULL, 0, 0};
+    write_bvh(mo, scale, &b);
+    char *text = sm_alloc(sm_settings(), b.n + 1);
+    if (!text) {
+        sm_set_error("out of memory");
+        return NULL;
+    }
+    b = (sm_buf){text, b.n + 1, 0};
+    write_bvh(mo, scale, &b);
+    text[b.n] = 0;
+    return text;
+}
+
+bool sm_export_motion_bvh(sm_motion motion, const char *file_name) {
+    char *text = sm_export_motion_bvh_text(motion, 100);
+    if (!text) return false;
+    FILE *f = file_name ? sm_open_file(file_name, "wb") : NULL;
+    const size_t n = strlen(text);
+    const bool ok = f && fwrite(text, 1, n, f) == n;
+    if (f && fclose(f)) sm_set_error("cannot write the file");
+    if (!ok) sm_set_error("cannot write the file");
+    sm_free(text);
+    return ok && !sm_get_error()[0];
 }

@@ -14,11 +14,11 @@ static uint8_t *read_all(const char *path, size_t *n) {
 }
 
 /* counting allocator: every alloc must be freed */
-typedef struct { long live, total; } counter;
-static void *c_alloc(void *u, size_t size, size_t align) { counter *c = u; void *p = NULL; if (posix_memalign(&p, align, size ? size : 1)) return NULL; c->live++; c->total++; return p; }
-static void  c_free(void *u, void *p) { counter *c = u; c->live--; free(p); }
+static long live, total;
+static void *c_alloc(size_t size, size_t align) { void *p = NULL; if (posix_memalign(&p, align, size ? size : 1)) return NULL; live++; total++; return p; }
+static void  c_free(void *p) { live--; free(p); }
 
-static void test_tokenizer(const sm_model *m, const char *path) {
+static void test_tokenizer(const sm_model_impl *m, const char *path) {
     size_t n; uint8_t *b = read_all(path, &n); CHECK(b != NULL); if (!b) return;
     sm_tok_work *w = malloc(sizeof *w); uint32_t count; memcpy(&count, b, 4); size_t at = 4; uint32_t bad = 0;
     for (uint32_t i = 0; i < count; i++) {
@@ -34,7 +34,7 @@ static void test_tokenizer(const sm_model *m, const char *path) {
 }
 
 /* the codes_i and feat_i arrays of vq_golden.bin, through the loaded file; the time on one thread */
-static void test_decoder(const sm_model *m, const char *path) {
+static void test_decoder(const sm_model_impl *m, const char *path) {
     CHECK(load_goldens(path));
     double worst = 0, secs = 0;
     uint32_t frames = 0;
@@ -66,33 +66,29 @@ static void test_decoder(const sm_model *m, const char *path) {
 
 static void test_corrupt(const uint8_t *file, size_t n) {  /* any damage: an error status or a valid model, never a crash */
     uint8_t *b = malloc(n); unsigned s = 12345; int ok = 0, bad = 0; char err[128];
-    counter c = {0, 0}; sm_hooks h = SM_HOOKS_INIT; h.alloc = c_alloc; h.free = c_free; h.user = &c;
+    live = total = 0;
     for (int i = 0; i < 3000; i++) {
         memcpy(b, file, n); size_t len = n;
         s = s * 1103515245u + 12345u;
         if (i % 3 == 0) len = (s >> 4) % (i < 1500 ? 70000 : n);                    /* truncated */
         else for (int k = 0; k < 1 + i % 4; k++) { s = s * 1103515245u + 12345u; b[(s >> 4) % 70000] ^= (uint8_t)(1u << (s % 8)); }  /* header bits */
-        sm_model *m = NULL;
-        const sm_status st = sm_model_load_memory(b, len, SM_LOAD_BORROW | SM_LOAD_NOCHECK, &h, &m, err, sizeof err);
-        if (st == SM_OK) { ok++; CHECK(m != NULL); sm_model_free(m); } else { bad++; CHECK(m == NULL && err[0]); }
+        sm_model_impl *m = NULL;
+        const sm_status st = sm_load(b, len, SM_LOAD_BORROW | SM_LOAD_NOCHECK, &m, err, sizeof err);
+        if (st == SM_OK) { ok++; CHECK(m != NULL); sm_unload(m); } else { bad++; CHECK(m == NULL && err[0]); }
     }
     memcpy(b, file, n); b[n - 100] ^= 1;                                               /* a data bit: the CRC finds it */
-    sm_model *m = NULL; CHECK(sm_model_load_memory(b, n, SM_LOAD_BORROW, &h, &m, err, sizeof err) == SM_E_CHECKSUM && !m);
-    printf("corrupt files: %d rejected, %d still valid (flips in unused bytes), %ld allocations, %ld not freed\n", bad, ok, c.total, c.live);
-    CHECK(c.live == 0); free(b);
+    sm_model_impl *m = NULL; CHECK(sm_load(b, n, SM_LOAD_BORROW, &m, err, sizeof err) == SM_E_CHECKSUM && !m);
+    printf("corrupt files: %d rejected, %d still valid (flips in unused bytes), %ld allocations, %ld not freed\n", bad, ok, total, live);
+    CHECK(live == 0); free(b);
 }
 
 static void test_api(const uint8_t *file, size_t n) {
-    char err[128]; sm_model *m = (sm_model *)1;
-    CHECK(sm_model_load_memory(NULL, n, 0, NULL, &m, err, sizeof err) == SM_E_ARG);
-    sm_hooks h = {0}; CHECK(sm_model_load_memory(file, n, 0, &h, &m, err, sizeof err) == SM_E_ARG);   /* struct_size 0 */
-    CHECK(sm_model_load_file("/nonexistent/x.gguf", NULL, &m, err, sizeof err) == SM_E_IO);
-    CHECK(sm_model_load_memory(file, n, 0, NULL, &m, NULL, 0) == SM_OK);                                /* err is optional */
-    CHECK(!strcmp(sm_model_meta(m, "general.architecture"), "sprongmotion"));
-    CHECK(!strncmp(sm_model_id(m), "SprongMotion-14M@", 17));
-    CHECK(sm_model_info(m, SM_I_FPS) == 20 && sm_model_info(m, SM_I_JOINTS) == 22 && sm_model_info(m, 999) == -1);
-    CHECK(!strcmp(sm_status_name(SM_E_CHECKSUM), "SM_E_CHECKSUM") && !strcmp(sm_status_name(-1234), "SM_E_UNKNOWN"));
-    sm_model_free(m); sm_model_free(NULL);
+    CHECK(!sm_is_model_valid(sm_load_model_from_memory(NULL, n)) && !strcmp(sm_get_error(), "data is NULL"));
+    sm_model m = sm_load_model_from_memory(file, n);
+    CHECK(sm_is_model_valid(m) && !sm_get_error()[0]);
+    CHECK(!strcmp(sm_get_model_meta(m, "general.architecture"), "sprongmotion"));
+    CHECK(!strncmp(m.id, "SprongMotion-14M@", 17) && m.fps == 20 && m.joint_count == 22);
+    sm_unload_model(m);
 }
 
 /* the bytes right after a GGUF key or tensor name (8-byte length, then the text), or NULL */
@@ -105,36 +101,37 @@ static uint8_t *after(uint8_t *b, size_t n, const char *name) {
 
 /* sprongmotion.defaults.* set the defaults within the runtime's limits; format 2 only; the skeleton must be there */
 static void test_settings(const uint8_t *file, size_t n) {
-    uint8_t *b = malloc(n); sm_model *m = NULL; double lo, hi, d; char err[128];
+    uint8_t *b = malloc(n); sm_model_impl *m = NULL; char err[128];
     memcpy(b, file, n); uint8_t *v = after(b, n, "sprongmotion.defaults.steps"); CHECK(v != NULL); if (!v) { free(b); return; }
     const uint32_t steps[3] = {12, 99, 0};   /* in range, above the limit 64, below the minimum 1 */
     for (int i = 0; i < 3; i++) {
         memcpy(v + 4, &steps[i], 4);
-        const sm_status s = sm_model_load_memory(b, n, SM_LOAD_BORROW, NULL, &m, err, sizeof err);
-        CHECK(i ? s == SM_E_FORMAT && !m : s == SM_OK && sm_param_bounds(m, SM_P_STEPS, &lo, &hi, &d, NULL) == SM_OK);
-        if (!i) CHECK(d == 12 && lo == 1 && hi == 64 && strstr(sm_model_schema_json(m), "\"default\":12}"));
-        sm_model_free(m); m = NULL;
+        const sm_status s = sm_load(b, n, SM_LOAD_BORROW, &m, err, sizeof err);
+        CHECK(i ? s == SM_E_FORMAT && !m : s == SM_OK);
+        if (!i) CHECK(m->param[SM_P_STEPS][2] == 12 && m->param[SM_P_STEPS][0] == 1 && m->param[SM_P_STEPS][1] == 64);
+        sm_unload(m); m = NULL;
     }
     memcpy(b, file, n); v = after(b, n, "sprongmotion.format_version"); CHECK(v != NULL);
     if (v) { const uint32_t one = 1; memcpy(v + 4, &one, 4); }   /* format 1: not loaded */
-    CHECK(sm_model_load_memory(b, n, SM_LOAD_BORROW, NULL, &m, err, sizeof err) == SM_E_VERSION && !m);
+    CHECK(sm_load(b, n, SM_LOAD_BORROW, &m, err, sizeof err) == SM_E_VERSION && !m);
     memcpy(b, file, n); v = after(b, n, "skeleton.offsets"); CHECK(v != NULL); if (v) v[-1] = 'S';
-    CHECK(sm_model_load_memory(b, n, SM_LOAD_BORROW, NULL, &m, err, sizeof err) == SM_E_FORMAT);
+    CHECK(sm_load(b, n, SM_LOAD_BORROW, &m, err, sizeof err) == SM_E_FORMAT);
     CHECK(strstr(err, "skeleton") != NULL);
-    float off[66]; CHECK(sm_model_load_memory(file, n, 0, NULL, &m, NULL, 0) == SM_OK);
-    CHECK(sm_skeleton_offsets(m, off, 66) == SM_OK);
-    CHECK(off[0] == 0 && off[3 * 4 + 1] < -0.3f && off[3 * 4 + 1] > -0.5f);   /* the knee below the hip */
-    sm_model_free(m); free(b);
+    sm_model model = sm_load_model_from_memory(file, n);
+    const float *off = model.rest_offsets;
+    CHECK(off && off[0] == 0 && off[3 * 4 + 1] < -0.3f && off[3 * 4 + 1] > -0.5f);   /* the knee below the hip */
+    sm_unload_model(model); free(b);
 }
 
 int main(void) {
     size_t n; uint8_t *file = read_all("tests/data/test.gguf", &n); CHECK(file != NULL); if (!file) return CHECK_DONE();
-    counter c = {0, 0}; sm_hooks h = SM_HOOKS_INIT; h.alloc = c_alloc; h.free = c_free; h.user = &c; char err[128];
-    sm_model *m = NULL; const sm_status s = sm_model_load_file("tests/data/test.gguf", &h, &m, err, sizeof err);
-    if (s != SM_OK) fprintf(stderr, "load: %s\n", err);
-    CHECK(s == SM_OK);
-    if (m) { test_tokenizer(m, "tests/data/tok_golden.bin"); test_decoder(m, "tests/data/vq_golden.bin"); sm_model_free(m); }
-    CHECK(c.live == 0);
+    sm_set_memory_functions(c_alloc, c_free);
+    sm_model model = sm_load_model("tests/data/test.gguf");
+    if (!sm_is_model_valid(model)) fprintf(stderr, "load: %s\n", sm_get_error());
+    CHECK(sm_is_model_valid(model));
+    const sm_model_impl *m = model.internal;
+    if (m) { test_tokenizer(m, "tests/data/tok_golden.bin"); test_decoder(m, "tests/data/vq_golden.bin"); sm_unload_model(model); }
+    CHECK(live == 0);
     test_corrupt(file, n); test_api(file, n); test_settings(file, n);
     free(file); return CHECK_DONE();
 }

@@ -16,10 +16,11 @@ build/examples/01_hello SprongMotion-14M-v1.0-Q8_0.gguf "waves with the right ha
 In C:
 
 ```c
-sm_model *m; sm_motion *out; char err[256];
-sm_model_load_file("SprongMotion-14M-v1.0-Q8_0.gguf", NULL, &m, err, sizeof err);
-sm_motion_create(m, &out);
-sm_generate_simple(m, "waves with the left hand", 3.0, 7, out, err, sizeof err);
+sm_model model = sm_load_model("SprongMotion-14M-v1.0-Q8_0.gguf");
+sm_motion motion = sm_generate_motion(model, "waves with the left hand", 3.0f, 7);
+if (!sm_export_motion_bvh(motion, "wave.bvh")) puts(sm_get_error());
+sm_unload_motion(motion);
+sm_unload_model(model);
 ```
 
 In JavaScript, with the WebAssembly build ([examples/05_wasm.mjs](examples/05_wasm.mjs), browser or node):
@@ -30,7 +31,7 @@ const generate = await load("sprongmotion.wasm", "SprongMotion-14M-v1.0-Q8_0.ggu
 const bvh = generate("walks forward", 4);
 ```
 
-The API is documented in [include/sm.h](include/sm.h), the design (architecture, model file, determinism, speed) in
+The API is documented in [include/sprongmotion.h](include/sprongmotion.h), the design (architecture, model file, determinism, speed) in
 [docs/design.md](docs/design.md). [examples/](examples/) has small programs from text to BVH up to editing.
 
 ## Build
@@ -59,8 +60,8 @@ Some tests compare against reference tensors in `tests/data/`, which is not publ
 | Windows x86-64 | MinGW-w64 gcc (MSYS2), `make dist` | `libsprongmotion.dll`, import library `libsprongmotion.dll.a`, `libsprongmotion.a` |
 | WebAssembly | emcc, `make dist-wasm` | `sprongmotion.wasm` (SIMD128), `sprongmotion-plain.wasm`: standalone, exports `sm_*`, `malloc`, `free`, `memory` |
 
-Each package holds `include/sm.h`, the libraries, LICENSE, NOTICE, this README and CHANGELOG.md. The header is stable
-within major version 1: functions, parameters and statuses are only added.
+Each package holds `include/sprongmotion.h`, the libraries, LICENSE, NOTICE, this README and CHANGELOG.md. The header is
+stable from 1.1 on within major version 1: functions are only added and structs only grow at the end.
 
 ## License
 

@@ -2,7 +2,7 @@
 #define _DEFAULT_SOURCE   /* sysconf on glibc with -std=c11 */
 #include "sm_internal.h"
 
-void sm_par_for(const sm_par *p, uint32_t n, sm_task_fn fn, void *arg) {
+void sm_par_for(const sm_par *p, uint32_t n, sm_job_fn fn, void *arg) {
     if (p && p->run && n > 1) {
         p->run(p->user, n, fn, arg);
         return;
@@ -12,7 +12,7 @@ void sm_par_for(const sm_par *p, uint32_t n, sm_task_fn fn, void *arg) {
 
 #if defined(__wasm__)
 void *sm_pool_create(const sm_hooks *h, uint32_t threads) { (void)h; (void)threads; return NULL; }
-void  sm_pool_run(void *pool, uint32_t n, sm_task_fn fn, void *arg) { (void)pool; sm_par_for(NULL, n, fn, arg); }
+void  sm_pool_run(void *pool, uint32_t n, sm_job_fn fn, void *arg) { (void)pool; sm_par_for(NULL, n, fn, arg); }
 void  sm_pool_free(const sm_hooks *h, void *pool) { (void)h; (void)pool; }
 #else
 #include <stdatomic.h>
@@ -64,7 +64,7 @@ typedef struct {
     atomic_int busy, quit, sleepers;
     atomic_uint generation, done;
     _Atomic uint64_t claim;
-    sm_task_fn fn;
+    sm_job_fn fn;
     void *arg;
     uint32_t n_workers;
     thread_t threads[MAX_THREADS];
@@ -120,7 +120,7 @@ static void wake_workers(pool *p) {
 }
 
 /* a caller arriving while another run is in progress runs its own tasks */
-void sm_pool_run(void *handle, uint32_t n, sm_task_fn fn, void *arg) {
+void sm_pool_run(void *handle, uint32_t n, sm_job_fn fn, void *arg) {
     pool *p = handle;
     if (n < 2 || atomic_exchange(&p->busy, 1)) {
         sm_par_for(NULL, n, fn, arg);
@@ -158,6 +158,6 @@ void sm_pool_free(const sm_hooks *h, void *handle) {
     wake_workers(p);
     for (uint32_t i = 0; i < p->n_workers; i++) join(p->threads[i]);
     lock_done(&p->lock, &p->wake);
-    sm_free(h, p);
+    sm_dealloc(h, p);
 }
 #endif

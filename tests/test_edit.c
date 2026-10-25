@@ -25,9 +25,10 @@ static double local_jerk(const float *f0, const float *f1, const float *f2, cons
     }
     return s / 21 * 8000;
 }
-static void measure(seams *st, const sm_motion *mo, const uint32_t *junctions, int nj) {
-    uint32_t T; const float *f = sm_motion_features(mo, &T), *jt = sm_motion_joints(mo, NULL); const uint8_t *ct = sm_motion_contacts(mo, NULL);
-    T /= SM_F;
+static void measure(seams *st, sm_motion mo, const uint32_t *junctions, int nj) {
+    const uint32_t T = (uint32_t)mo.frame_count;
+    const float *f = mo.features, *jt = mo.joints;
+    const uint8_t *ct = mo.contacts;
     static const uint32_t feet[4] = {7, 10, 8, 11};
     for (uint32_t t = 0; t + 3 < T; t++) {
         int at = 0, near = 0;
@@ -113,46 +114,56 @@ static float *canonical(const float *joints, uint32_t T) {
     free(tmp); free(f); return j;
 }
 
-static void test_encoder(const sm_model *m, sm_ctx *c, sm_request *r) {
-    sm_motion *mo; sm_motion_create(m, &mo);
-    uint32_t same[6] = {0}, tokens = 0; double rt[2] = {0}, secs = 0; uint32_t frames = 0;
+static sm_motion made(sm_motion mo) {
+    if (!sm_is_motion_valid(mo)) fprintf(stderr, "  %s\n", sm_get_error());
+    CHECK(sm_is_motion_valid(mo));
+    return mo;
+}
+
+static void test_encoder(sm_model m, sm_options o) {
+    uint32_t same[6] = {0}, tokens = 0, frames = 0;
+    double rt[2] = {0}, secs = 0;
     for (uint32_t i = 0; i < n_clips; i++) {
-        const clip *k = &clips[i]; const clock_t t0 = clock();
-        CHECK(sm_ctx_encode_motion(c, r, k->joints, k->T, mo) == SM_OK);
+        const clip *k = &clips[i];
+        const clock_t t0 = clock();
+        sm_motion mo = made(sm_encode_motion(m, k->joints, (int)k->T, o));
         secs += (double)(clock() - t0) / CLOCKS_PER_SEC, frames += k->T;
-        uint32_t n; const int16_t *codes = sm_motion_codes(mo, &n); CHECK(n == (k->T - 1) / 2 * 6);
-        for (uint32_t j = 0; j < n; j++) same[j % 6] += codes[j] == (int16_t)k->codes[j];
+        const uint32_t n = (uint32_t)mo.token_count * 6;
+        CHECK(n == (k->T - 1) / 2 * 6);
+        for (uint32_t j = 0; j < n; j++) same[j % 6] += mo.codes[j] == (int16_t)k->codes[j];
         tokens += n / 6;
         float *ref = canonical(k->joints, k->T);
-        for (int rel = 0; rel < 2; rel++) rt[rel] += mpjpe(sm_motion_joints(mo, NULL), ref, sm_motion_frames(mo), rel) / n_clips;
+        for (int rel = 0; rel < 2; rel++) rt[rel] += mpjpe(mo.joints, ref, (uint32_t)mo.frame_count, rel) / n_clips;
         free(ref);
+        sm_unload_motion(mo);
     }
     printf("encoder vs torch: codes equal per layer %.1f %.1f %.1f %.1f %.1f %.1f %% of %u tokens; round trip %.1f mm "
            "(%.1f mm root-relative, %u clips); encode + decode %.1f ms per 10 s\n", 100.0 * same[0] / tokens,
            100.0 * same[1] / tokens, 100.0 * same[2] / tokens, 100.0 * same[3] / tokens, 100.0 * same[4] / tokens,
            100.0 * same[5] / tokens, tokens, rt[0], rt[1], n_clips, secs / frames * 200 * 1000);
-    CHECK(same[0] >= tokens * 99 / 100 && same[5] >= tokens * 9 / 10); CHECK(rt[1] < 40);
+    CHECK(same[0] >= tokens * 99 / 100 && same[5] >= tokens * 9 / 10);
+    CHECK(rt[1] < 40);
     static const char *texts[4] = {"a person walks forward", "a person jumps", "a person dances", "a person kicks with the left leg"};
-    double own[2] = {0}, input = 0; uint32_t agree = 0, total = 0; sm_motion *g; sm_motion_create(m, &g);
+    double own[2] = {0}, input = 0;
+    uint32_t agree = 0, total = 0;
     for (int i = 0; i < 4; i++) {   /* generated clips: the codes come back and so do the joints */
-        sm_request_set_text(r, texts[i], -1); sm_request_set_int(r, SM_P_SEED, 40 + i);
-        CHECK(sm_ctx_generate(c, r, &g, 1) == SM_OK);
-        uint32_t T = sm_motion_frames(g), n; const float *j = sm_motion_joints(g, NULL);
-        CHECK(sm_ctx_encode_motion(c, r, j, T, mo) == SM_OK);
-        const int16_t *a = sm_motion_codes(g, &n), *b = sm_motion_codes(mo, NULL);
-        for (uint32_t k = 0; k < sm_motion_frames(mo) / 2; k++) agree += a[6 * k] == b[6 * k], total++;
-        float *ref = canonical(j, T);
-        for (int rel = 0; rel < 2; rel++) own[rel] += mpjpe(sm_motion_joints(mo, NULL), ref, sm_motion_frames(mo), rel) / 4;
-        input += mpjpe(sm_motion_joints(mo, NULL), j, sm_motion_frames(mo), 1) / 4;
+        o.seed = 40 + i;
+        sm_motion g = made(sm_generate_motion_ex(m, texts[i], o));
+        sm_motion mo = made(sm_encode_motion(m, g.joints, g.frame_count, o));
+        for (int k = 0; k < mo.frame_count / 2; k++) agree += g.codes[6 * k] == mo.codes[6 * k], total++;
+        float *ref = canonical(g.joints, (uint32_t)g.frame_count);
+        for (int rel = 0; rel < 2; rel++) own[rel] += mpjpe(mo.joints, ref, (uint32_t)mo.frame_count, rel) / 4;
+        input += mpjpe(mo.joints, g.joints, (uint32_t)mo.frame_count, 1) / 4;
         free(ref);
+        sm_unload_motion(mo);
+        sm_unload_motion(g);
     }
     printf("generated clips: round trip %.1f mm (%.1f root-relative) on the target skeleton, %.1f root-relative vs the "
            "clip's own joints; base codes back %.0f %%\n", own[0], own[1], input, 100.0 * agree / total);
     CHECK(own[1] < 40);
     const float zero[3 * SM_J * 3] = {0}, nan_[3 * SM_J * 3] = {NAN};
-    CHECK(sm_ctx_encode_motion(c, r, zero, 3, mo) == SM_E_NUMERIC && sm_motion_frames(mo) == 0);
-    CHECK(sm_ctx_encode_motion(c, r, nan_, 3, mo) == SM_E_ARG && sm_ctx_encode_motion(c, r, zero, 2, mo) == SM_E_ARG);
-    sm_motion_free(g); sm_motion_free(mo);
+    CHECK(!sm_is_motion_valid(sm_encode_motion(m, zero, 3, o)) && strstr(sm_get_error(), "no pose"));
+    CHECK(!sm_is_motion_valid(sm_encode_motion(m, nan_, 3, o)) && !sm_is_motion_valid(sm_encode_motion(m, zero, 2, o)));
 }
 
 static const char *const PAIRS[8][2] = {
@@ -162,35 +173,46 @@ static const char *const PAIRS[8][2] = {
     {"a person kicks with the left leg", "a person punches forward"}, {"a person walks forward", "a person walks forward"},
 };
 
-static void test_pins(const sm_model *m, sm_ctx *c, sm_request *r) {
-    sm_motion *a, *b; sm_motion_create(m, &a); sm_motion_create(m, &b);
-    int16_t pins[50 * 6]; seams in = {0}, lock = {0}; int exact = 1;
-    sm_request_set_float(r, SM_P_SECONDS, 5);
+static void test_pins(sm_model m, sm_options o) {
+    int16_t pins[50 * 6];
+    seams in = {0}, lock = {0};
+    int exact = 1;
+    o.seconds = 5;
     for (int i = 0; i < 8; i++) {
-        sm_request_set_codes(r, NULL, 0); sm_request_set_text(r, PAIRS[i][0], -1); sm_request_set_int(r, SM_P_SEED, i);
-        CHECK(sm_ctx_generate(c, r, &a, 1) == SM_OK);
-        memcpy(pins, sm_motion_codes(a, NULL), sizeof pins);
+        o.pinned_token_count = 0;
+        o.seed = i;
+        sm_motion a = made(sm_generate_motion_ex(m, PAIRS[i][0], o));
+        memcpy(pins, a.codes, sizeof pins);
+        sm_unload_motion(a);
         for (int t = 20; t < 30; t++) pins[6 * t] = -1;   /* regenerate 2 s in the middle, both ends pinned */
-        sm_request_set_text(r, PAIRS[i][1], -1); sm_request_set_int(r, SM_P_SEED, 100 + i);
-        CHECK(sm_request_set_codes(r, pins, 50) == SM_OK && sm_ctx_generate(c, r, &b, 1) == SM_OK);
-        const int16_t *got = sm_motion_codes(b, NULL);
-        for (int k = 0; k < 300; k++) exact &= pins[k - k % 6] < 0 || got[k] == pins[k];
+        o.seed = 100 + i;
+        o.pinned_codes = pins;
+        o.pinned_token_count = 50;
+        sm_motion b = made(sm_generate_motion_ex(m, PAIRS[i][1], o));
+        for (int k = 0; k < 300; k++) exact &= pins[k - k % 6] < 0 || b.codes[k] == pins[k];
         measure(&in, b, (const uint32_t[]){40, 60}, 2);
-        CHECK(sm_request_set_codes(r, pins, 20) == SM_OK && sm_ctx_generate(c, r, &b, 1) == SM_OK);   /* lock 2 s */
-        exact &= !memcmp(sm_motion_codes(b, NULL), pins, sizeof(int16_t) * 120);
+        sm_unload_motion(b);
+        o.pinned_token_count = 20;   /* lock 2 s */
+        b = made(sm_generate_motion_ex(m, PAIRS[i][1], o));
+        exact &= !memcmp(b.codes, pins, sizeof(int16_t) * 120);
         measure(&lock, b, (const uint32_t[]){40}, 1);
+        sm_unload_motion(b);
     }
     CHECK(exact);
     printf("pinned tokens come back exactly: %s\n", exact ? "yes" : "NO");
-    report("in-painting (2 s, both ends pinned)", &in); report("a locked 2 s block, then free", &lock);
-    const int16_t bad[6] = {512, 0, 0, 0, 0, 0}, ok[6] = {3, -1, 7, -1, -1, -1};
-    CHECK(sm_request_set_codes(r, bad, 1) == SM_E_ARG && strstr(sm_request_last_error(r), "a code = 512"));
-    CHECK(sm_request_set_codes(r, NULL, 1) == SM_E_ARG && sm_request_set_codes(r, ok, 513) == SM_E_ARG);
-    sm_request_set_float(r, SM_P_SECONDS, 0.5);
+    report("in-painting (2 s, both ends pinned)", &in);
+    report("a locked 2 s block, then free", &lock);
+    const int16_t bad[6] = {512, 0, 0, 0, 0, 0};
+    o.pinned_codes = bad;
+    o.pinned_token_count = 1;
+    CHECK(!sm_is_motion_valid(sm_generate_motion_ex(m, "a", o)) && strstr(sm_get_error(), "a pinned code = 512"));
+    o.pinned_codes = NULL;
+    CHECK(!sm_is_motion_valid(sm_generate_motion_ex(m, "a", o)) && strstr(sm_get_error(), "pinned_codes is NULL"));
     int16_t many[6 * 6] = {0};
-    CHECK(sm_request_set_codes(r, many, 6) == SM_OK && sm_ctx_generate(c, r, &b, 1) == SM_E_ARG);   /* 6 pins, 5 tokens */
-    sm_request_set_codes(r, NULL, 0);
-    sm_motion_free(a); sm_motion_free(b);
+    o.seconds = 0.5f;
+    o.pinned_codes = many;
+    o.pinned_token_count = 6;   /* 6 pins, 5 tokens */
+    CHECK(!sm_is_motion_valid(sm_generate_motion_ex(m, "a", o)) && strstr(sm_get_error(), "pinned tokens = 6"));
 }
 
 static double pose_dist(const float *f0, const float *f1) {   /* local pose distance, cm, mean over joints */
@@ -199,80 +221,97 @@ static double pose_dist(const float *f0, const float *f1) {   /* local pose dist
     return s / 21 * 100;
 }
 
-static void test_loop(const sm_model *m, sm_ctx *c, sm_request *r) {
-    sm_motion *a, *b; sm_motion_create(m, &a); sm_motion_create(m, &b);
+static void test_loop(sm_model m, sm_options o) {
     list wrap[2] = {{0}}, step = {0}, jerk[2] = {{0}}, inside = {0};
-    sm_request_set_float(r, SM_P_SECONDS, 4);
+    o.seconds = 4;
     for (int i = 0; i < 8; i++)
         for (int loop = 0; loop < 2; loop++) {
-            sm_request_set_text(r, PAIRS[i][0], -1); sm_request_set_int(r, SM_P_SEED, i); sm_request_set_int(r, SM_P_LOOP, loop);
-            CHECK(sm_ctx_generate(c, r, &a, 1) == SM_OK && sm_motion_frames(a) == 80);
-            uint32_t T; const float *f = sm_motion_features(a, &T); T /= SM_F;
+            o.seed = i;
+            o.loop = loop;
+            sm_motion a = made(sm_generate_motion_ex(m, PAIRS[i][0], o));
+            CHECK(a.frame_count == 80);
+            const uint32_t T = (uint32_t)a.frame_count;
+            const float *f = a.features;
             add(&wrap[loop], pose_dist(f + (T - 1) * SM_F, f));
-            const float *w[6]; for (uint32_t k = 0; k < 6; k++) w[k] = f + ((T - 3 + k) % T) * SM_F;   /* across the wrap */
+            const float *w[6];
+            for (uint32_t k = 0; k < 6; k++) w[k] = f + ((T - 3 + k) % T) * SM_F;   /* across the wrap */
             for (int k = 0; k < 3; k++) add(&jerk[loop], local_jerk(w[k], w[k + 1], w[k + 2], w[k + 3]));
-            if (!loop) continue;
-            for (uint32_t t = 10; t + 10 < T; t++) {
-                add(&step, pose_dist(f + t * SM_F, f + (t + 1) * SM_F));
-                add(&inside, local_jerk(f + t * SM_F, f + (t + 1) * SM_F, f + (t + 2) * SM_F, f + (t + 3) * SM_F));
+            if (loop) {
+                for (uint32_t t = 10; t + 10 < T; t++) {
+                    add(&step, pose_dist(f + t * SM_F, f + (t + 1) * SM_F));
+                    add(&inside, local_jerk(f + t * SM_F, f + (t + 1) * SM_F, f + (t + 2) * SM_F, f + (t + 3) * SM_F));
+                }
+                int16_t rot[40 * 6];
+                for (int k = 0; k < 40 * 6; k++) rot[k] = a.codes[(k + 7 * 6) % (40 * 6)];   /* the cycle from token 7 */
+                sm_motion b = made(sm_decode_codes(m, rot, 40, o));
+                CHECK(!memcmp(b.features, f + 14 * SM_F, sizeof(float) * 66 * SM_F));   /* circular */
+                CHECK(!memcmp(b.features + 66 * SM_F, f, sizeof(float) * 14 * SM_F));
+                sm_unload_motion(b);
             }
-            uint32_t n; int16_t rot[40 * 6]; const int16_t *codes = sm_motion_codes(a, &n);
-            for (int k = 0; k < 40 * 6; k++) rot[k] = codes[(k + 7 * 6) % (40 * 6)];   /* the cycle from token 7 */
-            CHECK(sm_ctx_decode_codes(c, r, rot, 40, b) == SM_OK);
-            CHECK(!memcmp(sm_motion_features(b, NULL), f + 14 * SM_F, sizeof(float) * 66 * SM_F));   /* circular */
-            CHECK(!memcmp(sm_motion_features(b, NULL) + 66 * SM_F, f, sizeof(float) * 14 * SM_F));
+            sm_unload_motion(a);
         }
     printf("loops (4 s, 8 prompts): last to first frame %.1f cm (median) vs %.1f cm without the loop, %.1f cm between "
            "frames inside; jerk at the wrap %.1f vs %.1f without, %.1f inside\n", pct(&wrap[1], 0.5), pct(&wrap[0], 0.5),
            pct(&step, 0.5), pct(&jerk[1], 0.5), pct(&jerk[0], 0.5), pct(&inside, 0.5));
     CHECK(pct(&wrap[1], 0.5) < pct(&wrap[0], 0.5));
-    sm_request_set_int(r, SM_P_LOOP, 0);
     for (int i = 0; i < 2; i++) free(wrap[i].v), free(jerk[i].v);
-    free(step.v), free(inside.v); sm_motion_free(a); sm_motion_free(b);
+    free(step.v), free(inside.v);
 }
 
-static void test_timeline(const sm_model *m, sm_ctx *c, sm_request *r) {
-    sm_motion *a, *b; sm_motion_create(m, &a); sm_motion_create(m, &b);
+static void test_timeline(sm_model m, sm_options o) {
     seams st = {0};
     for (int i = 0; i < 8; i++) {
-        const char *texts[3] = {PAIRS[i][0], PAIRS[i][1], PAIRS[(i + 1) % 8][0]};
-        double sec[3] = {3, 2, 3.5}; int32_t seeds[3] = {i, 50 + i, 90 + i}; uint32_t first[4];
-        CHECK(sm_ctx_generate_blocks(c, r, 3, texts, NULL, sec, seeds, NULL, first, a) == SM_OK && sm_motion_frames(a) == 170);
-        CHECK(first[1] == 60 && first[2] == 100 && first[3] == 170);
+        sm_block b[3] = {{PAIRS[i][0], NULL, 3, i, NULL}, {PAIRS[i][1], NULL, 2, 50 + i, NULL},
+                         {PAIRS[(i + 1) % 8][0], NULL, 3.5f, 90 + i, NULL}};
+        sm_motion a = made(sm_generate_timeline(m, b, 3, o));
+        CHECK(a.frame_count == 170 && a.block_start_frames[1] == 60 && a.block_start_frames[2] == 100);
+        CHECK(a.block_start_frames[3] == 170);
         measure(&st, a, (const uint32_t[]){60, 100}, 2);
-        if (i) continue;
-        CHECK(sm_ctx_generate_blocks(c, r, 3, texts, NULL, sec, seeds, NULL, NULL, b) == SM_OK);   /* the same motion */
-        CHECK(!memcmp(sm_motion_joints(a, NULL), sm_motion_joints(b, NULL), sizeof(float) * 170 * SM_J * 3));
-        const int16_t *codes = sm_motion_codes(a, NULL), *keep[3] = {codes, NULL, codes + 50 * 6};
-        seeds[1] = 7, sec[1] = 2.5;   /* edit the middle block: the others stay */
-        CHECK(sm_ctx_generate_blocks(c, r, 3, texts, NULL, sec, seeds, keep, first, b) == SM_OK && sm_motion_frames(b) == 180);
-        CHECK(!memcmp(sm_motion_codes(b, NULL), codes, sizeof(int16_t) * 30 * 6) && first[2] == 110);
-        CHECK(!memcmp(sm_motion_codes(b, NULL) + 55 * 6, codes + 50 * 6, sizeof(int16_t) * 35 * 6));
-        CHECK(!memcmp(sm_motion_features(b, NULL), sm_motion_features(a, NULL), sizeof(float) * 26 * SM_F));
-        sm_text *t; sm_text_create(m, &t); sm_ctx_encode_text(c, texts[1], -1, t);   /* an encoded text, the same codes */
-        const sm_text *encs[3] = {NULL, t, NULL};
-        CHECK(sm_ctx_generate_blocks(c, r, 3, NULL, encs, sec, seeds, keep, NULL, a) == SM_OK);
-        CHECK(!memcmp(sm_motion_codes(a, NULL), sm_motion_codes(b, NULL), sizeof(int16_t) * 90 * 6));
-        sm_text_free(t);
+        if (i) {
+            sm_unload_motion(a);
+            continue;
+        }
+        sm_motion again = made(sm_generate_timeline(m, b, 3, o));   /* the same motion */
+        CHECK(!memcmp(a.joints, again.joints, sizeof(float) * 170 * SM_J * 3));
+        sm_unload_motion(again);
+        b[0].kept_codes = a.codes;
+        b[2].kept_codes = a.codes + 50 * 6;
+        b[1].seed = 7, b[1].seconds = 2.5f;   /* edit the middle block: the others stay */
+        sm_motion e = made(sm_generate_timeline(m, b, 3, o));
+        CHECK(e.frame_count == 180 && !memcmp(e.codes, a.codes, sizeof(int16_t) * 30 * 6) && e.block_start_frames[2] == 110);
+        CHECK(!memcmp(e.codes + 55 * 6, a.codes + 50 * 6, sizeof(int16_t) * 35 * 6));
+        CHECK(!memcmp(e.features, a.features, sizeof(float) * 26 * SM_F));
+        sm_text t = sm_encode_text(m, b[1].prompt);   /* an encoded text, the same codes */
+        b[1].prompt = NULL;
+        b[1].text = &t;
+        sm_motion f = made(sm_generate_timeline(m, b, 3, o));
+        CHECK(!memcmp(f.codes, e.codes, sizeof(int16_t) * 90 * 6));
+        sm_unload_text(t);
+        sm_unload_motion(f);
+        sm_unload_motion(e);
+        sm_unload_motion(a);
     }
     report("timeline (3 blocks, 8 sets)", &st);
-    sm_motion_free(a); sm_motion_free(b);
 }
 
 int main(void) {
     load_golden("tests/data/enc_golden.bin");
     test_features();
-    const char *dir = getenv("SM_MODEL_DIR"); char path[512], err[128]; sm_model *m = NULL;
+    const char *dir = getenv("SM_MODEL_DIR");
+    char path[512];
     snprintf(path, sizeof path, "%s/SprongMotion-14M-v1.0-Q8_0.gguf", dir ? dir : "tests/data");
-    if (sm_model_load_file(path, NULL, &m, err, sizeof err) != SM_OK || !sm_model_info(m, SM_I_ENCODER)) {
+    sm_model m = sm_load_model(path);
+    if (!m.has_encoder) {
         printf("test_edit: no model with the encoder at %s, model tests skipped\n", path);
     } else {
-        sm_ctx *c; sm_request *r; sm_ctx_create(m, &c); sm_request_create(m, &r);
-        sm_request_set_int(r, SM_P_FOOT_LOCK, 0);   /* the model's own feet, for the slide numbers */
-        test_encoder(m, c, r); test_pins(m, c, r); test_loop(m, c, r); test_timeline(m, c, r);
-        sm_request_free(r); sm_ctx_free(c);
+        sm_options o = sm_default_options(m);
+        o.foot_lock = false;   /* the model's own feet, for the slide numbers */
+        test_encoder(m, o);
+        test_pins(m, o);
+        test_loop(m, o);
+        test_timeline(m, o);
     }
-    sm_model_free(m);
+    sm_unload_model(m);
     for (uint32_t i = 0; i < n_clips; i++) free(clips[i].joints), free(clips[i].feat), free(clips[i].codes);
     return CHECK_DONE();
 }

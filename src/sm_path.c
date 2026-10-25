@@ -9,7 +9,7 @@
 
 /* "path[i].x = v is out of range lo .. hi"; a time not after the one before says so */
 static sm_status bad(sm_request *r, uint32_t i, int k, double v, double lo, double hi) {
-    static const char *const what[4] = {"t", "x", "z", "heading"};
+    static const char *const what[4] = {"time", "x", "z", "heading"};
     char name[32];
     snprintf(name, sizeof name, "path[%u].%s", i, what[k]);
     if (k || !(v >= lo && v <= hi)) return sm_fail_range(r->err, sizeof r->err, SM_E_ARG, name, v, lo, hi);
@@ -22,12 +22,11 @@ static sm_status bad(sm_request *r, uint32_t i, int k, double v, double lo, doub
     return SM_E_ARG;
 }
 
-sm_status sm_request_set_path(sm_request *r, const float *points, uint32_t n) {
-    if (!r) return SM_E_ARG;
-    r->err[0] = 0;
-    if (n && !points) return sm_fail(r->err, sizeof r->err, SM_E_ARG, "points is NULL");
-    if (n == 1 || n > SM_MAX_PATH)
-        return sm_fail_range(r->err, sizeof r->err, SM_E_ARG, "path points", n, 2, SM_MAX_PATH);
+sm_status sm_set_path(sm_request *r, const float *points, int count) {
+    if (count && !points) return sm_fail(r->err, sizeof r->err, SM_E_ARG, "path is NULL");
+    if (count < 0 || count == 1 || count > SM_MAX_PATH)
+        return sm_fail_range(r->err, sizeof r->err, SM_E_ARG, "path_count", count, 2, SM_MAX_PATH);
+    const uint32_t n = (uint32_t)count;
     double last = -1;   /* a free first point is at 0 */
     for (uint32_t i = 0; i < n; i++) {
         const float *p = points + 4 * i;
@@ -42,12 +41,12 @@ sm_status sm_request_set_path(sm_request *r, const float *points, uint32_t n) {
     return SM_OK;
 }
 
-sm_status sm_path_check(const sm_model *m, const sm_path *p, uint32_t tokens, char *err, size_t err_len) {
+sm_status sm_path_check(const sm_model_impl *m, const sm_path *p, uint32_t tokens, char *err, size_t err_len) {
     const double seconds = (double)tokens * m->frames_per_token / m->fps;
     for (uint32_t i = 0; i < p->n; i++)
         if (p->p[4 * i] > seconds + 1e-3) {
             char name[24];
-            snprintf(name, sizeof name, "path[%u].t", i);
+            snprintf(name, sizeof name, "path[%u].time", i);
             return sm_fail_range(err, err_len, SM_E_ARG, name, p->p[4 * i], 0, seconds);
         }
     return SM_OK;

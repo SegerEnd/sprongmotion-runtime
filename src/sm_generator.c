@@ -5,12 +5,12 @@ enum { N_CODES = 512, MASK_ID = 512, RES_N = 513 };   /* RES_N: the codes and th
 enum { TABLE = 0, MATRIX = 1, MATRIX_BIAS = 2 };      /* what lin() binds */
 #define PINNED_SCORE 1e5f                              /* never re-masked */
 
-static int has(const sm_model *m, const char *name) {
+static int has(const sm_model_impl *m, const char *name) {
     uint64_t dims[2] = {0, 0};
     return sm_gguf_tensor(&m->g, name, SM_T_Q8_0, 2, dims) || sm_gguf_tensor(&m->g, name, SM_T_F32, 2, dims);
 }
 
-static const float *vec(const sm_model *m, const char *name, uint64_t n, char *err, size_t err_len) {
+static const float *vec(const sm_model_impl *m, const char *name, uint64_t n, char *err, size_t err_len) {
     uint64_t dims[1] = {n};
     return sm_need(m, name, SM_T_F32, 1, dims, err, err_len);
 }
@@ -18,7 +18,7 @@ static const float *vec(const sm_model *m, const char *name, uint64_t n, char *e
 static uint32_t head_count(uint32_t d) { return d / 64 > 4 ? d / 64 : 4; }
 
 /* [n][k] rows, Q8_0 or F32 (k or n 0: any); a MATRIX_BIAS is name.w and name.b */
-static int lin(const sm_model *m, sm_lin *l, const char *name, int kind, uint64_t k, uint64_t n, char *err,
+static int lin(const sm_model_impl *m, sm_lin *l, const char *name, int kind, uint64_t k, uint64_t n, char *err,
                size_t err_len) {
     char weight[64], bias[64];
     uint64_t dims[2] = {k, n};
@@ -41,14 +41,14 @@ static int lin(const sm_model *m, sm_lin *l, const char *name, int kind, uint64_
     return kind != MATRIX_BIAS || (l->b = vec(m, bias, l->n, err, err_len));
 }
 
-static int norm(const sm_model *m, sm_norm *n, const char *name, uint32_t d, char *err, size_t err_len) {
+static int norm(const sm_model_impl *m, sm_norm *n, const char *name, uint32_t d, char *err, size_t err_len) {
     char weight[64], bias[64];
     snprintf(weight, sizeof weight, "%s.w", name);
     snprintf(bias, sizeof bias, "%s.b", name);
     return (n->w = vec(m, weight, d, err, err_len)) && (n->b = vec(m, bias, d, err, err_len));
 }
 
-static int bind_layer(const sm_model *m, sm_layer *l, const char *prefix, uint32_t d, char *err, size_t err_len) {
+static int bind_layer(const sm_model_impl *m, sm_layer *l, const char *prefix, uint32_t d, char *err, size_t err_len) {
     static const char *const part[6] = {"attn.qkv", "attn.out", "ff1", "ff2", "ln1", "ln2"};
     char name[6][48];
     for (int i = 0; i < 6; i++) snprintf(name[i], sizeof name[i], "%s.%s", prefix, part[i]);
@@ -60,7 +60,7 @@ static int bind_layer(const sm_model *m, sm_layer *l, const char *prefix, uint32
 }
 
 /* layers by probing prefix.L0, prefix.L1, ... */
-static int stack(const sm_model *m, sm_layer *layers, const char *prefix, uint32_t d, uint32_t *n, char *err,
+static int stack(const sm_model_impl *m, sm_layer *layers, const char *prefix, uint32_t d, uint32_t *n, char *err,
                  size_t err_len) {
     for (*n = 0; *n < SM_MAX_LAYERS; ++*n) {
         char layer[40], probe[56];
@@ -73,7 +73,7 @@ static int stack(const sm_model *m, sm_layer *layers, const char *prefix, uint32
     return 1;
 }
 
-static int bind_text(const sm_model *m, sm_textenc *t, char *err, size_t err_len) {
+static int bind_text(const sm_model_impl *m, sm_textenc *t, char *err, size_t err_len) {
     uint64_t dims[2] = {0, 0};
     if (!lin(m, &t->emb, "text.emb", TABLE, 0, 0, err, err_len)) return 0;
     if (!lin(m, &t->emb_up, "text.emb_up", MATRIX, t->emb.k, 0, err, err_len)) return 0;
@@ -91,7 +91,7 @@ static int bind_text(const sm_model *m, sm_textenc *t, char *err, size_t err_len
     return 1;
 }
 
-static int bind_residual_tables(const sm_model *m, sm_gen *g, char *err, size_t err_len) {
+static int bind_residual_tables(const sm_model_impl *m, sm_gen *g, char *err, size_t err_len) {
     for (uint32_t q = 1; q < SM_VQ_LAYERS; q++) {
         char in[16], out[16];
         snprintf(in, sizeof in, "res.in%u", q);
@@ -104,7 +104,7 @@ static int bind_residual_tables(const sm_model *m, sm_gen *g, char *err, size_t 
     return 1;
 }
 
-static int bind_heads(const sm_model *m, sm_gen *g, uint32_t text_dim, char *err, size_t err_len) {
+static int bind_heads(const sm_model_impl *m, sm_gen *g, uint32_t text_dim, char *err, size_t err_len) {
     const uint32_t d = g->d;
     uint64_t quant_dims[2] = {SM_VQ_LAYERS, d};
     const struct { sm_lin *l; const char *name; int kind; uint32_t k, n; } lins[] = {
@@ -128,22 +128,23 @@ static int bind_heads(const sm_model *m, sm_gen *g, uint32_t text_dim, char *err
     return g->tok.n > MASK_ID ? 1 : !sm_fail(err, err_len, SM_E_FORMAT, "bad mask.tok");
 }
 
+static size_t add_layers(sm_lin **all, size_t n, sm_layer *layers, uint32_t count) {
+    for (uint32_t l = 0; l < count; l++) {
+        all[n++] = &layers[l].qkv;
+        all[n++] = &layers[l].out;
+        all[n++] = &layers[l].ff1;
+        all[n++] = &layers[l].ff2;
+    }
+    return n;
+}
+
 /* every matrix the kernel multiplies, dequantised once into panels */
-static sm_status pack_weights(sm_model *m, char *err, size_t err_len) {
+static sm_status pack_weights(sm_model_impl *m, char *err, size_t err_len) {
     sm_textenc *t = &m->text;
     sm_gen *g = &m->gen;
     sm_lin *all[2 * 4 * SM_MAX_LAYERS + 16];
-    size_t n = 0;
-    for (uint32_t l = 0; l < t->layers; l++) {
-        sm_layer *layer = &t->L[l];
-        sm_lin *four[4] = {&layer->qkv, &layer->out, &layer->ff1, &layer->ff2};
-        for (int i = 0; i < 4; i++) all[n++] = four[i];
-    }
-    for (uint32_t l = 0; l < g->layers; l++) {
-        sm_layer *layer = &g->mask.L[l];
-        sm_lin *four[4] = {&layer->qkv, &layer->out, &layer->ff1, &layer->ff2};
-        for (int i = 0; i < 4; i++) all[n++] = four[i];
-    }
+    size_t n = add_layers(all, 0, t->L, t->layers);
+    n = add_layers(all, n, g->mask.L, g->layers);
     sm_lin *heads[] = {&t->emb_up, &t->out, &g->mask.cond, &g->mask.word, &g->mask.dense, &g->mask.out, &g->res.cond,
                        &g->res.dense};
     for (size_t i = 0; i < sizeof heads / sizeof heads[0]; i++) all[n++] = heads[i];
@@ -161,7 +162,7 @@ static sm_status pack_weights(sm_model *m, char *err, size_t err_len) {
     return SM_OK;
 }
 
-sm_status sm_bind_gen(sm_model *m, char *err, size_t err_len) {
+sm_status sm_bind_gen(sm_model_impl *m, char *err, size_t err_len) {
     if (!has(m, "text.emb")) return SM_OK;
     sm_textenc *t = &m->text;
     sm_gen *g = &m->gen;

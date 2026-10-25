@@ -9,88 +9,105 @@ static uint64_t fnv(uint64_t h, const void *p, size_t n) {
     return h;
 }
 
-static uint64_t hash(const sm_motion *mo) {   /* joints, rotations, root, contacts, offsets */
-    uint32_t n; uint64_t h = 0xcbf29ce484222325ull; const float *f;
-    f = sm_motion_joints(mo, &n); h = fnv(h, f, n * 4u); f = sm_motion_rotations(mo, &n); h = fnv(h, f, n * 4u);
-    f = sm_motion_root(mo, &n); h = fnv(h, f, n * 4u); const uint8_t *u = sm_motion_contacts(mo, &n); h = fnv(h, u, n);
-    f = sm_motion_offsets(mo, &n); return fnv(h, f, n * 4u);
+/* joints, rotations, root, contacts, offsets */
+static uint64_t hash(sm_motion mo) {
+    const size_t T = (size_t)mo.frame_count;
+    uint64_t h = fnv(0xcbf29ce484222325ull, mo.joints, T * 66 * 4);
+    h = fnv(h, mo.rotations, T * 88 * 4);
+    h = fnv(h, mo.root, T * 3 * 4);
+    h = fnv(h, mo.contacts, T * 4);
+    return fnv(h, mo.offsets, 66 * 4);
 }
 
-static int finite(const sm_motion *mo) {
-    uint32_t n, m; const float *j = sm_motion_joints(mo, &n), *q = sm_motion_rotations(mo, &m);
-    for (uint32_t i = 0; i < n; i++) if (!isfinite(j[i])) return 0;
-    for (uint32_t i = 0; i < m; i++) if (!isfinite(q[i])) return 0;
-    return n > 0 && isfinite(sm_motion_path_error(mo)) && sm_motion_path_error(mo) >= 0;
+static int finite(sm_motion mo) {
+    for (int i = 0; i < mo.frame_count * 66; i++) if (!isfinite(mo.joints[i])) return 0;
+    for (int i = 0; i < mo.frame_count * 88; i++) if (!isfinite(mo.rotations[i])) return 0;
+    return mo.frame_count > 0 && isfinite(mo.path_error) && mo.path_error >= 0;
+}
+
+static sm_motion made(sm_motion mo) {
+    if (!sm_is_motion_valid(mo)) fprintf(stderr, "  %s\n", sm_get_error());
+    CHECK(sm_is_motion_valid(mo));
+    return mo;
+}
+
+static int failed_with(sm_motion mo, const char *msg) {
+    if (!sm_is_motion_valid(mo) && !strcmp(sm_get_error(), msg)) return 1;
+    fprintf(stderr, "  got \"%s\", want \"%s\"\n", sm_get_error(), msg);
+    sm_unload_motion(mo);
+    return 0;
+}
+
+static sm_options with_path(sm_options o, const float *p, int n) {
+    o.path = (const sm_path_point *)p;
+    o.path_count = n;
+    return o;
 }
 
 static int16_t codes[60 * 6];
 
-/* rejected points name themselves; a rejected call keeps the path set before */
-static void test_points(const sm_model *m) {
-    sm_request *r = NULL; sm_ctx *c = NULL; sm_motion *a = NULL, *b = NULL;
-    CHECK(sm_request_create(m, &r) == SM_OK && sm_ctx_create(m, &c) == SM_OK);
-    CHECK(sm_motion_create(m, &a) == SM_OK && sm_motion_create(m, &b) == SM_OK);
+/* rejected points name themselves */
+static void test_points(sm_model m) {
     float p[1025 * 4];
     for (int i = 0; i < 1025; i++) p[4 * i] = NAN, p[4 * i + 1] = 0.01f * (float)i, p[4 * i + 2] = 0.1f * (float)i, p[4 * i + 3] = NAN;
-    const struct { int i, k; float v; uint32_t n; const char *msg; } bad[] = {
-        {0, 0, 0, 1, "path points = 1 is out of range 2 .. 1024"}, {0, 0, 0, 1025, "path points = 1025 is out of range 2 .. 1024"},
+    const struct { int i, k; float v; int n; const char *msg; } bad[] = {
+        {0, 0, 0, 1, "path_count = 1 is out of range 2 .. 1024"}, {0, 0, 0, 1025, "path_count = 1025 is out of range 2 .. 1024"},
         {1, 1, NAN, 3, "path[1].x = nan is out of range -1000 .. 1000"}, {2, 2, 1e6f, 3, "path[2].z = 1000000 is out of range -1000 .. 1000"},
-        {1, 3, INFINITY, 3, "path[1].heading = inf is out of range -1000 .. 1000"}, {0, 0, -1, 3, "path[0].t = -1 is out of range 0 .. 600"},
-        {2, 0, 601, 3, "path[2].t = 601 is out of range 0 .. 600"}, {1, 0, 0, 3, "path[1].t = 0 is not after the time before it"},
+        {1, 3, INFINITY, 3, "path[1].heading = inf is out of range -1000 .. 1000"}, {0, 0, -1, 3, "path[0].time = -1 is out of range 0 .. 600"},
+        {2, 0, 601, 3, "path[2].time = 601 is out of range 0 .. 600"}, {1, 0, 0, 3, "path[1].time = 0 is not after the time before it"},
     };
-    CHECK(sm_request_set_path(r, p, 3) == SM_OK);
+    const sm_options o = sm_default_options(m);
     for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
-        float q[3 * 4]; memcpy(q, p, sizeof q);
+        float q[1025 * 4];
+        memcpy(q, p, sizeof q);
         if (bad[i].n == 3) q[4 * bad[i].i + bad[i].k] = bad[i].v;
-        CHECK(sm_request_set_path(r, q, bad[i].n) == SM_E_ARG && !strcmp(sm_request_last_error(r), bad[i].msg));
-        if (strcmp(sm_request_last_error(r), bad[i].msg)) fprintf(stderr, "  got \"%s\"\n", sm_request_last_error(r));
+        CHECK(failed_with(sm_decode_codes(m, codes, 60, with_path(o, q, bad[i].n)), bad[i].msg));
     }
     p[4] = 2, p[8] = 2;
-    CHECK(sm_request_set_path(r, p, 3) == SM_E_ARG && strstr(sm_request_last_error(r), "path[2].t = 2 is not after"));
+    CHECK(failed_with(sm_decode_codes(m, codes, 60, with_path(o, p, 3)), "path[2].time = 2 is not after the time before it"));
     p[8] = 7;
-    CHECK(sm_request_set_path(r, NULL, 2) == SM_E_ARG && sm_request_set_path(NULL, p, 2) == SM_E_ARG);
-    CHECK(sm_request_set_path(r, p, 3) == SM_OK && sm_ctx_decode_codes(c, r, codes, 60, a) == SM_E_ARG);
-    CHECK(!strcmp(sm_ctx_last_error(c), "path[2].t = 7 is out of range 0 .. 6"));
-    CHECK(sm_request_set_path(r, p, 1024) == SM_OK && sm_request_set_path(r, NULL, 0) == SM_OK);
-    CHECK(sm_model_info(m, SM_I_PATH_INPUT) == 0 && sm_model_info(m, SM_I_PATH_INPUT + 1) == -1);
-    sm_param pw = sm_param_from_name("path_warp"); double lo, hi, d; int32_t is_int;
-    CHECK(pw == SM_P_PATH_WARP && sm_param_bounds(m, pw, &lo, &hi, &d, &is_int) == SM_OK && d == 1 && is_int);
-    CHECK(sm_param_name(12) == NULL && strstr(sm_api_schema_json(), "\"name\":\"path\""));
-    sm_motion_free(a); sm_motion_free(b); sm_ctx_free(c); sm_request_free(r);
+    CHECK(failed_with(sm_decode_codes(m, codes, 60, with_path(o, NULL, 2)), "path is NULL"));
+    CHECK(failed_with(sm_decode_codes(m, codes, 60, with_path(o, p, 3)), "path[2].time = 7 is out of range 0 .. 6"));
+    p[8] = 5;
+    sm_motion mo = made(sm_decode_codes(m, codes, 60, with_path(o, p, 1024)));
+    sm_unload_motion(mo);
+    CHECK(!m.follows_path && o.path_warp);
 }
 
-/* without a path the output matches the stored hashes; a set and cleared path, and a path with the warp off, change
-   nothing */
-static void test_golden(const sm_model *m) {
+/* without a path the output matches the stored hashes; a path with the warp off changes nothing */
+static void test_golden(sm_model m) {
     static const uint64_t golden[4] = {0x95ecc839c38c7862ull, 0x82a6180c9827e58bull, 0xf78669154625cef1ull,
                                        0x827c89241ade4e14ull};   /* foot lock 0/1 x in place 0/1 */
-    sm_request *r = NULL; sm_ctx *c = NULL; sm_motion *mo = NULL; uint32_t n;
-    CHECK(sm_request_create(m, &r) == SM_OK && sm_ctx_create(m, &c) == SM_OK && sm_motion_create(m, &mo) == SM_OK);
     const float p[3 * 4] = {NAN, 0, 0, NAN, NAN, 1, 2, NAN, NAN, -1, 5, NAN};
     for (int k = 0; k < 4; k++) {
-        sm_request_set_int(r, SM_P_FOOT_LOCK, k & 1), sm_request_set_int(r, SM_P_IN_PLACE, k >> 1);
-        CHECK(sm_ctx_decode_codes(c, r, codes, 60, mo) == SM_OK && hash(mo) == golden[k] && sm_motion_path_error(mo) == -1);
-        CHECK(sm_request_set_path(r, p, 3) == SM_OK && sm_request_set_int(r, SM_P_PATH_WARP, 0) == SM_OK);
-        CHECK(sm_ctx_decode_codes(c, r, codes, 60, mo) == SM_OK && hash(mo) == golden[k] && sm_motion_path_error(mo) > 0);
-        CHECK(sm_request_set_int(r, SM_P_PATH_WARP, 1) == SM_OK && sm_ctx_decode_codes(c, r, codes, 60, mo) == SM_OK);
-        CHECK(hash(mo) != golden[k] && sm_request_set_path(r, NULL, 0) == SM_OK);
-        CHECK(sm_ctx_decode_codes(c, r, codes, 60, mo) == SM_OK && hash(mo) == golden[k]);
+        sm_options o = sm_default_options(m);
+        o.foot_lock = k & 1;
+        o.in_place = k >> 1;
+        sm_motion a = made(sm_decode_codes(m, codes, 60, o));
+        CHECK(hash(a) == golden[k] && a.path_error == -1);
+        o = with_path(o, p, 3);
+        o.path_warp = false;
+        sm_motion b = made(sm_decode_codes(m, codes, 60, o));
+        CHECK(hash(b) == golden[k] && b.path_error > 0);
+        o.path_warp = true;
+        sm_motion c = made(sm_decode_codes(m, codes, 60, o));
+        CHECK(hash(c) != golden[k] && a.speed && a.frame_count == 120);
+        sm_unload_motion(a);
+        sm_unload_motion(b);
+        sm_unload_motion(c);
     }
-    CHECK(sm_motion_speed(mo, &n) && n == 120 && sm_motion_speed(NULL, &n) == NULL && n == 0);
-    CHECK(sm_motion_path_error(NULL) == -1);
-    sm_motion_free(mo); sm_ctx_free(c); sm_request_free(r);
 }
 
-
 /* random, duplicate, collinear, closed, far and timed points: always a finite motion */
-static void test_fuzz(const sm_model *m) {
+static void test_fuzz(sm_model m) {
     static float p[SM_MAX_PATH * 4];
-    sm_request *r = NULL; sm_ctx *c = NULL; sm_motion *mo = NULL; unsigned s = 7; int bad = 0, runs = 0;
-    CHECK(sm_request_create(m, &r) == SM_OK && sm_ctx_create(m, &c) == SM_OK && sm_motion_create(m, &mo) == SM_OK);
+    unsigned s = 7;
+    int bad = 0, runs = 0;
     static const uint32_t sizes[] = {2, 2, 3, 4, 5, 9, 40, 1024};
     for (int kind = 0; kind < 8; kind++)
         for (size_t z = 0; z < sizeof sizes / sizeof sizes[0]; z++, runs++) {
-            const uint32_t n = sizes[z]; double t = 0;
+            const uint32_t n = sizes[z];
+            double t = 0;
             for (uint32_t i = 0; i < n; i++) {
                 float *q = p + 4 * i;
                 const double a = 2 * 3.14159265 * i / (n - 1.0);
@@ -101,19 +118,21 @@ static void test_fuzz(const sm_model *m) {
                        : kind == 2 ? 0 : rnd(&s) * 5);
                 if (kind >= 5 && rnd(&s) < 0.3 && (t += 0.01 + rnd(&s) * 5.9 / n) < 6) q[0] = (float)t;
             }
-            sm_request_set_int(r, SM_P_LOOP, kind == 3);
-            const sm_status st = sm_request_set_path(r, p, n);
-            if (st != SM_OK) { bad++; fprintf(stderr, "fuzz %d/%u: %s\n", kind, n, sm_request_last_error(r)); continue; }
-            if (sm_ctx_decode_codes(c, r, codes, 60, mo) != SM_OK || !finite(mo)) bad++;
+            sm_options o = with_path(sm_default_options(m), p, (int)n);
+            o.loop = kind == 3;
+            sm_motion mo = sm_decode_codes(m, codes, 60, o);
+            if (!sm_is_motion_valid(mo)) fprintf(stderr, "fuzz %d/%u: %s\n", kind, n, sm_get_error());
+            bad += !sm_is_motion_valid(mo) || !finite(mo);
+            sm_unload_motion(mo);
         }
     printf("fuzzed paths: %d decodes, %d failed or not finite\n", runs, bad);
     CHECK(bad == 0);
-    sm_motion_free(mo); sm_ctx_free(c); sm_request_free(r);
 }
 
-static double travel(const sm_motion *mo) {   /* the smoothed root's arc length */
-    uint32_t n; const float *v = sm_motion_speed(mo, &n); double s = 0;
-    for (uint32_t t = 0; t < n; t++) s += v[t] / 20;
+/* the smoothed root's arc length */
+static double travel(sm_motion mo) {
+    double s = 0;
+    for (int t = 0; t < mo.frame_count; t++) s += mo.speed[t] / 20;
     return s;
 }
 
@@ -146,10 +165,10 @@ static double dist_to(const double *g, uint32_t lo, uint32_t hi, const float *q)
 /* the largest distance from a point to the warped root's path part P(S(t)) = root - R(dpsi) (g - g smoothed), with g
    the unwarped root and dpsi the hips' added yaw (a timed point: at its time +-1 frame); smoothed: to the warped root
    smoothed as the warp smooths, which also cuts inside a curve by about sigma^2 / 2r */
-static double off_path(const sm_motion *w, const sm_motion *plain, const float *p, uint32_t n, int smoothed) {
+static double off_path(sm_motion w, sm_motion plain, const float *p, uint32_t n, int smoothed) {
     static double g[2 * 4000], P[2 * 4000]; static float sp[4000];
-    const uint32_t T = sm_motion_frames(w); double worst = 0;
-    const float *a = sm_motion_joints(plain, NULL), *b = sm_motion_joints(w, NULL);
+    const uint32_t T = (uint32_t)w.frame_count; double worst = 0;
+    const float *a = plain.joints, *b = w.joints;
     sm_root_smooth(smoothed ? b : a, T, 20, smoothed ? P : g, sp);
     for (uint32_t t = 0; t < T && !smoothed; t++) {
         const float *x = a + (size_t)t * 66, *y = b + (size_t)t * 66;
@@ -165,80 +184,93 @@ static double off_path(const sm_motion *w, const sm_motion *plain, const float *
     return worst;
 }
 
-static double max_diff(const sm_motion *a, const sm_motion *b) {
-    uint32_t n; const float *x = sm_motion_joints(a, &n), *y = sm_motion_joints(b, NULL); double d = 0;
-    for (uint32_t i = 0; i < n; i++) d = fmax(d, fabs((double)x[i] - y[i]));
+static double max_diff(sm_motion a, sm_motion b) {
+    double d = 0;
+    for (int i = 0; i < a.frame_count * 66; i++) d = fmax(d, fabs((double)a.joints[i] - b.joints[i]));
     return d;
 }
 
-static void test_warp(const sm_model *m) {
+static void test_warp(sm_model m) {
     static float p[SM_MAX_PATH * 4];
     static double g[2 * 400]; static float sp[400];
-    sm_request *r = NULL; sm_ctx *c = NULL; sm_motion *base = NULL, *w = NULL, *x = NULL;
-    CHECK(sm_request_create(m, &r) == SM_OK && sm_ctx_create(m, &c) == SM_OK);
-    CHECK(sm_motion_create(m, &base) == SM_OK && sm_motion_create(m, &w) == SM_OK && sm_motion_create(m, &x) == SM_OK);
-    sm_request_set_text(r, "a person keeps walking forward", -1), sm_request_set_float(r, SM_P_SECONDS, 6);
-    sm_request_set_int(r, SM_P_SEED, 1);
-    CHECK(sm_ctx_generate(c, r, &base, 1) == SM_OK);
-    const uint32_t T = sm_motion_frames(base); const double L = travel(base);
+    sm_options o = sm_default_options(m);
+    o.seconds = 6;
+    o.seed = 1;
+    const char *walk = "a person keeps walking forward";
+    sm_motion base = made(sm_generate_motion_ex(m, walk, o));
+    const uint32_t T = (uint32_t)base.frame_count;
+    const double L = travel(base);
     double worst = 0, sm[3];
     for (int shape = 0; shape < 3; shape++) {   /* on the path */
         const uint32_t n = shape_points(shape, L, p);
-        CHECK(sm_request_set_path(r, p, n) == SM_OK && sm_ctx_generate(c, r, &w, 1) == SM_OK);
+        sm_motion w = made(sm_generate_motion_ex(m, walk, with_path(o, p, (int)n)));
         worst = fmax(worst, off_path(w, base, p, n, 0)), sm[shape] = off_path(w, base, p, n, 1);
-        CHECK(!memcmp(sm_motion_codes(w, NULL), sm_motion_codes(base, NULL), sizeof(int16_t) * 6 * T / 2));
+        CHECK(!memcmp(w.codes, base.codes, sizeof(int16_t) * 6 * T / 2));
+        sm_unload_motion(w);
     }
     const float timed[3 * 4] = {NAN, 0, 0, NAN, 3, 0, (float)(0.55 * L), NAN, NAN, 0, (float)L, NAN};
-    CHECK(sm_request_set_path(r, timed, 3) == SM_OK && sm_ctx_generate(c, r, &w, 1) == SM_OK);
+    sm_motion w = made(sm_generate_motion_ex(m, walk, with_path(o, timed, 3)));
     const double at_time = off_path(w, base, timed, 3, 0);
-    sm_root_smooth(sm_motion_joints(base, NULL), T, 20, g, sp);   /* its own path, a point per frame */
+    sm_unload_motion(w);
+    sm_root_smooth(base.joints, T, 20, g, sp);   /* its own path, a point per frame */
     uint32_t n = 0;
     for (uint32_t t = 0; t < T; t++, n++) p[4 * n] = NAN, p[4 * n + 1] = (float)g[2 * t], p[4 * n + 2] = (float)g[2 * t + 1], p[4 * n + 3] = NAN;
-    CHECK(sm_request_set_path(r, p, n) == SM_OK && sm_ctx_generate(c, r, &w, 1) == SM_OK);
+    w = made(sm_generate_motion_ex(m, walk, with_path(o, p, (int)n)));
     const double own = max_diff(w, base);
+    sm_unload_motion(w);
     printf("path: on the path within %.2f mm (straight, S, r 4 m), smoothed root %.0f / %.0f / %.0f mm; a timed point %.2f mm; "
            "its own path moves joints %.2f mm\n", worst * 1e3, sm[0] * 1e3, sm[1] * 1e3, sm[2] * 1e3, at_time * 1e3, own * 1e3);
     CHECK(worst <= 0.02 && at_time <= 0.02 && own <= 1e-3 && sm[0] <= 0.02 && sm[1] <= 0.04 && sm[2] <= 0.04);
 
     const uint32_t ns = shape_points(1, L, p);   /* the warp off: the motion of no path, the same error */
-    CHECK(sm_request_set_path(r, p, ns) == SM_OK && sm_ctx_generate(c, r, &w, 1) == SM_OK);
-    CHECK(sm_request_set_int(r, SM_P_PATH_WARP, 0) == SM_OK && sm_ctx_generate(c, r, &x, 1) == SM_OK);
-    CHECK(hash(x) == hash(base) && sm_motion_path_error(x) == sm_motion_path_error(w) && sm_motion_path_error(w) > 0.1f);
-    CHECK(sm_request_set_int(r, SM_P_PATH_WARP, 1) == SM_OK);
-    CHECK(sm_ctx_decode_codes(c, r, sm_motion_codes(w, NULL), T / 2, x) == SM_OK && hash(x) == hash(w));   /* decode only */
-    sm_motion *o[2] = {x, base}; uint32_t d, tot; sm_status s;   /* step API, variants */
-    CHECK(sm_ctx_begin(c, r, o, 2) == SM_OK);
-    while ((s = sm_ctx_step(c, &d, &tot)) == SM_OK) CHECK(sm_ctx_preview(c) == SM_OK);
-    CHECK(s == SM_DONE && sm_ctx_finish(c) == SM_OK && hash(x) == hash(w));
+    sm_options po = with_path(o, p, (int)ns);
+    w = made(sm_generate_motion_ex(m, walk, po));
+    po.path_warp = false;
+    sm_motion x = made(sm_generate_motion_ex(m, walk, po));
+    CHECK(hash(x) == hash(base) && x.path_error == w.path_error && w.path_error > 0.1f);
+    sm_unload_motion(x);
+    po.path_warp = true;
+    x = made(sm_decode_codes(m, w.codes, (int)T / 2, po));   /* decode only */
+    CHECK(hash(x) == hash(w));
+    sm_unload_motion(x);
+    sm_unload_motion(w);
 
-    const char *texts[2] = {"a person keeps walking forward", "a person walks forward slowly"};   /* timeline time */
-    const double sec[2] = {3, 3}; const int32_t seeds[2] = {1, 2}; uint32_t first[3];
-    CHECK(sm_request_set_path(r, NULL, 0) == SM_OK && sm_ctx_generate_blocks(c, r, 2, texts, NULL, sec, seeds, NULL, first, w) == SM_OK);
+    const sm_block blocks[2] = {{walk, NULL, 3, 1, NULL}, {"a person walks forward slowly", NULL, 3, 2, NULL}};   /* timeline time */
+    w = made(sm_generate_timeline(m, blocks, 2, o));
     const uint32_t nb = shape_points(2, travel(w), p);
-    CHECK(sm_request_set_path(r, p, nb) == SM_OK && sm_ctx_generate_blocks(c, r, 2, texts, NULL, sec, seeds, NULL, first, x) == SM_OK);
-    const int16_t *keep[2] = {sm_motion_codes(x, NULL), sm_motion_codes(x, NULL) + first[1] / 2 * 6};
-    CHECK(off_path(x, w, p, nb, 0) < 0.02 && !memcmp(sm_motion_codes(x, NULL), sm_motion_codes(w, NULL), sizeof(int16_t) * 6 * first[2] / 2));
-    CHECK(sm_motion_copy(base, x) == SM_OK && sm_ctx_generate_blocks(c, r, 2, NULL, NULL, sec, seeds, keep, NULL, x) == SM_OK);
-    CHECK(hash(x) == hash(base) && sm_motion_path_error(x) == sm_motion_path_error(base));
+    x = made(sm_generate_timeline(m, blocks, 2, with_path(o, p, (int)nb)));
+    CHECK(off_path(x, w, p, nb, 0) < 0.02 && !memcmp(x.codes, w.codes, sizeof(int16_t) * 6 * (size_t)x.block_start_frames[2] / 2));
+    const sm_block kept[2] = {{NULL, NULL, 3, 1, x.codes}, {NULL, NULL, 3, 2, x.codes + x.block_start_frames[1] / 2 * 6}};
+    sm_motion y = made(sm_generate_timeline(m, kept, 2, with_path(o, p, (int)nb)));
+    CHECK(hash(y) == hash(x) && y.path_error == x.path_error);
+    sm_unload_motion(y);
+    sm_unload_motion(w);
 
-    CHECK(sm_request_set_prefix(r, x) == SM_OK);   /* a prefix: the path in the previous clip's frame */
-    const float *end = sm_motion_root(x, NULL) + 3 * (sm_motion_frames(x) - 1);
+    o.previous = &x;   /* a previous motion: the path in its frame */
+    o.seconds = 3;
+    const float *end = x.root + 3 * (x.frame_count - 1);
     const float pre[2 * 4] = {NAN, end[0], end[2], NAN, NAN, end[0] + 3, end[2] + 3, NAN};
-    CHECK(sm_request_set_path(r, NULL, 0) == SM_OK && sm_request_set_float(r, SM_P_SECONDS, 3) == SM_OK);
-    CHECK(sm_ctx_generate(c, r, &base, 1) == SM_OK);
-    CHECK(sm_request_set_path(r, pre, 2) == SM_OK && sm_ctx_generate(c, r, &w, 1) == SM_OK);
+    sm_unload_motion(base);
+    base = made(sm_generate_motion_ex(m, walk, o));
+    w = made(sm_generate_motion_ex(m, walk, with_path(o, pre, 2)));
     CHECK(finite(w) && off_path(w, base, pre, 2, 0) < 0.02);
-    CHECK(sm_request_set_prefix(r, NULL) == SM_OK && sm_request_set_int(r, SM_P_LOOP, 1) == SM_OK);   /* a closed path */
-    CHECK(sm_request_set_path(r, NULL, 0) == SM_OK && sm_request_set_text(r, "a person walks in a circle", -1) == SM_OK);
-    CHECK(sm_ctx_generate(c, r, &base, 1) == SM_OK && sm_motion_copy(w, base) == SM_OK);
-    const double C = travel(w); n = 0;
+    sm_unload_motion(w);
+    sm_unload_motion(base);
+    sm_unload_motion(x);
+
+    o.previous = NULL;   /* a closed path */
+    o.loop = true;
+    base = made(sm_generate_motion_ex(m, "a person walks in a circle", o));
+    const double C = travel(base);
+    n = 0;
     for (int i = 0; i <= 32; i++, n++) {
         const double a = 2 * 3.14159265358979 * i / 32, rad = C / (2 * 3.14159265358979);
         p[4 * n] = NAN, p[4 * n + 1] = i < 32 ? (float)(rad - rad * cos(a)) : 0, p[4 * n + 2] = i < 32 ? (float)(rad * sin(a)) : 0, p[4 * n + 3] = NAN;
     }
-    CHECK(sm_request_set_path(r, p, n) == SM_OK && sm_ctx_generate(c, r, &w, 1) == SM_OK && finite(w));
-    CHECK(off_path(w, base, p, n, 0) < 0.02);
-    sm_motion_free(base); sm_motion_free(w); sm_motion_free(x); sm_ctx_free(c); sm_request_free(r);
+    w = made(sm_generate_motion_ex(m, "a person walks in a circle", with_path(o, p, (int)n)));
+    CHECK(finite(w) && off_path(w, base, p, n, 0) < 0.02);
+    sm_unload_motion(w);
+    sm_unload_motion(base);
 }
 
 static const int FEET[4] = {7, 10, 8, 11};
@@ -283,55 +315,66 @@ static void jerk(const float *j, uint32_t T, double *med, double *p95) {   /* wo
 
 /* the foot gate: 4 seeds, 6 s, at the prompt's own speed; ankle and toe slide and jerk median and p95 each within
    +20 % of the unwarped clip, both foot-locked */
-static void test_gate(const sm_model *m) {
+static void test_gate(sm_model m) {
     enum { SEEDS = 4 };
     static float p[SM_MAX_PATH * 4];
-    sm_request *r = NULL; sm_ctx *c = NULL; sm_motion *base[SEEDS] = {0}, *w = NULL;
-    CHECK(sm_request_create(m, &r) == SM_OK && sm_ctx_create(m, &c) == SM_OK && sm_motion_create(m, &w) == SM_OK);
-    for (int i = 0; i < SEEDS; i++) CHECK(sm_motion_create(m, &base[i]) == SM_OK);
-    sm_request_set_text(r, "a person keeps walking forward", -1), sm_request_set_float(r, SM_P_SECONDS, 6);
-    sm_request_set_int(r, SM_P_SEED, 1);
-    CHECK(sm_ctx_generate(c, r, base, SEEDS) == SM_OK);
+    const char *walk = "a person keeps walking forward";
+    sm_options o = sm_default_options(m);
+    o.seconds = 6;
+    sm_motion base[SEEDS];
+    for (int i = 0; i < SEEDS; i++) {
+        o.seed = 1 + i;
+        base[i] = made(sm_generate_motion_ex(m, walk, o));
+    }
     static const char *const names[3] = {"straight", "gentle S", "circle r 4 m"};
     for (int shape = 0; shape < 3; shape++) {
         double v[2][4] = {{0}};   /* unwarped, warped: ankle, toe, jerk median, p95 */
         for (int i = 0; i < SEEDS; i++) {
-            const uint32_t n = shape_points(shape, travel(base[i]), p), T = sm_motion_frames(base[i]);
-            CHECK(sm_request_set_int(r, SM_P_SEED, 1 + i) == SM_OK && sm_request_set_path(r, p, n) == SM_OK);
-            CHECK(sm_ctx_generate(c, r, &w, 1) == SM_OK);
-            const float *b = sm_motion_joints(base[i], NULL), *j = sm_motion_joints(w, NULL);
+            const uint32_t n = shape_points(shape, travel(base[i]), p), T = (uint32_t)base[i].frame_count;
+            o.seed = 1 + i;
+            sm_motion w = made(sm_generate_motion_ex(m, walk, with_path(o, p, (int)n)));
             for (int k = 0; k < 2; k++) {
-                const float *x = k ? j : b; double med, p95;
+                const float *x = k ? w.joints : base[i].joints;
+                double med, p95;
                 jerk(x, T, &med, &p95);
-                v[k][0] += slide(b, x, T, 0), v[k][1] += slide(b, x, T, 1), v[k][2] += med, v[k][3] += p95;
+                v[k][0] += slide(base[i].joints, x, T, 0), v[k][1] += slide(base[i].joints, x, T, 1);
+                v[k][2] += med, v[k][3] += p95;
             }
+            sm_unload_motion(w);
         }
         printf("gate %-12s ankle %+3.0f %%, toe %+3.0f %%, jerk median %+3.0f %%, p95 %+3.0f %%\n", names[shape],
                100 * (v[1][0] / v[0][0] - 1), 100 * (v[1][1] / v[0][1] - 1), 100 * (v[1][2] / v[0][2] - 1), 100 * (v[1][3] / v[0][3] - 1));
         for (int k = 0; k < 4; k++) CHECK(v[1][k] <= 1.2 * v[0][k]);
-        CHECK(sm_request_set_path(r, NULL, 0) == SM_OK);
     }
-    for (int i = 0; i < SEEDS; i++) sm_motion_free(base[i]);
-    sm_motion_free(w); sm_ctx_free(c); sm_request_free(r);
+    for (int i = 0; i < SEEDS; i++) sm_unload_motion(base[i]);
 }
 
 int main(void) {
     for (int i = 0; i < 60 * 6; i++) codes[i] = (int16_t)(i % 6 == 5 ? -1 : (i * 37 + i / 6 * 11) % 512);
-    char path[512], err[128]; sm_model *m = NULL;
-    CHECK(sm_model_load_file("tests/data/test.gguf", NULL, &m, err, sizeof err) == SM_OK);
-    if (!m) return CHECK_DONE();
-    test_points(m); test_golden(m); test_fuzz(m);
-    sm_model_free(m);
+    sm_model m = sm_load_model("tests/data/test.gguf");
+    CHECK(sm_is_model_valid(m));
+    if (!sm_is_model_valid(m)) return CHECK_DONE();
+    test_points(m);
+    test_golden(m);
+    test_fuzz(m);
+    sm_unload_model(m);
     const char *dir = getenv("SM_MODEL_DIR");
+    char path[512];
     snprintf(path, sizeof path, "%s/SprongMotion-14M-v1.0-Q8_0.gguf", dir ? dir : "tests/data");
-    if (!dir || sm_model_load_file(path, NULL, &m, err, sizeof err) != SM_OK) {
+    m = dir ? sm_load_model(path) : (sm_model){0};
+    if (!sm_is_model_valid(m)) {
         printf("test_path: no model in $SM_MODEL_DIR, warp tests skipped\n");
         return CHECK_DONE();
     }
     test_warp(m);
-    sm_model_free(m);
+    sm_unload_model(m);
     const char *gate = getenv("SM_GATE_MODEL");   /* the model the gate was measured on */
-    if (!gate || sm_model_load_file(gate, NULL, &m, err, sizeof err) != SM_OK) printf("test_path: no $SM_GATE_MODEL, gate skipped\n");
-    else test_gate(m), sm_model_free(m);
+    m = gate ? sm_load_model(gate) : (sm_model){0};
+    if (!sm_is_model_valid(m)) {
+        printf("test_path: no $SM_GATE_MODEL, gate skipped\n");
+        return CHECK_DONE();
+    }
+    test_gate(m);
+    sm_unload_model(m);
     return CHECK_DONE();
 }

@@ -1,6 +1,6 @@
 # Design
 
-How the runtime is built and why. The API itself is documented in `include/sm.h`.
+How the runtime is built and why. The API itself is documented in `include/sprongmotion.h`.
 
 ## Architecture
 
@@ -47,16 +47,17 @@ decoder and the text encoder are small. So the speed work is one matrix kernel.
 | File | Holds |
 |---|---|
 | `src/sm_gguf.c` | the GGUF reader and the CRC-32 |
-| `src/sm_model.c` | the model loader and tensor binding, status names, the allocator, file mapping |
+| `src/sm_bind.c` | binding a model file: tokenizer tables, decoder, skeleton, settings, metadata |
+| `src/sm_model.c` | loading a model, file mapping, the settings, errors, the allocator, the model's spare contexts |
 | `src/sm_tokenizer.c` | the CLIP tokenizer and its text cleanup |
 | `src/sm_layers.c` | the matrix kernel, layer norm, attention, transformer layers, the VQ decoder and encoder |
 | `src/sm_generator.c` | binding the text encoder and generator, and their passes |
 | `src/sm_sampling.c` | the sampling noise, top-k picks, the mask schedule, exact `exp`, `log` and float16 rounding |
-| `src/sm_context.c` | contexts: scratch memory, runs, the step API, decoding |
+| `src/sm_context.c` | contexts, text encoding, generating, decoding and encoding motions |
 | `src/sm_timeline.c` | prompt blocks on a timeline |
-| `src/sm_requests.c` | the parameter table, requests, text objects, the JSON schemas |
+| `src/sm_options.c` | the option table, the defaults, options checked into a request |
 | `src/sm_pose.c` | features to joints, rotations, the clip's skeleton, foot contacts and foot lock |
-| `src/sm_motion.c` | the motion object and BVH |
+| `src/sm_motion.c` | motions and BVH |
 | `src/sm_features.c` | joints to features, for the motion encoder |
 | `src/sm_path.c` | root paths and the path warp |
 | `src/sm_threads.c` | the built-in thread pool |
@@ -75,13 +76,13 @@ Keys the runtime reads:
 | Key | Meaning |
 |---|---|
 | `general.architecture` | `sprongmotion` |
-| `general.name`, `general.version`, `general.license`, ... | free metadata, readable with `sm_model_meta` |
+| `general.name`, `general.version`, `general.license`, ... | free metadata, readable with `sm_get_model_meta` |
 | `sprongmotion.format_version` | the schema version (2). A runtime reads files up to its own version |
-| `sprongmotion.data_crc32` | CRC-32 of the data section, checked at load. `sm_model_id` is `general.name@crc` |
+| `sprongmotion.data_crc32` | CRC-32 of the data section, checked at load. `model.id` is `general.name@crc` |
 | `sprongmotion.fps`, `.frames_per_token`, `.max_frames` | 20, 2, 200 |
 | `sprongmotion.tokenizer.max_len`, `.sot`, `.eot` | 40, 49406, 49407 |
 | `sprongmotion.skeleton.name` | the skeleton's name. Parents and offsets are tensors |
-| `sprongmotion.defaults.<param>` (`.min`, `.max`) | the default of a request parameter and the range the model allows |
+| `sprongmotion.defaults.<key>` (`.min`, `.max`) | an option's default and the range the model allows; keys `seconds`, `seed`, `steps`, `res_layers`, `cfg`, `res_cfg`, `temp`, `top_k`, `foot_lock`, `in_place`, `loop`, `path_warp` |
 | `sprongmotion.vq.encoder` | 1 when the file has the motion encoder |
 
 Tensors, by name (shapes innermost first):
@@ -116,14 +117,14 @@ Same model file, same request and same seed give bit-identical codes, features a
   counter, so which thread does which task does not change the result.
 - The sampling noise is a counter-based hash of (seed, pass, position, code), not a stream, so it does not depend on
   evaluation order.
-- The mask schedule is computed in double with round-half-even, and NaN or Inf logits fail the call (`SM_E_NUMERIC`).
+- The mask schedule is computed in double with round-half-even, and NaN or Inf logits fail the call.
 
 `make FAST=1` turns fused multiply-add on for native builds: about 1.7x faster, the same output at any thread count within
-that build, close to but not bit-identical with the others. `sm_build_info()` says "fma" then.
+that build, close to but not bit-identical with the others. `sm_get_build_info()` says "fma" then.
 
-A model starts its own thread pool at load (0 threads = the core count), or uses the host's `parallel_for` from
-`sm_hooks`, so a game engine or Blender can run the work on its own job system. WebAssembly builds are single-threaded
-unless the host gives `parallel_for`.
+A model starts its own thread pool at load (`sm_set_thread_count`, 0 = the core count), or uses the host's
+`sm_set_parallel_for`, so a game engine or Blender can run the work on its own job system. WebAssembly builds are
+single-threaded unless the host gives `parallel_for`.
 
 ## Speed
 
@@ -152,22 +153,21 @@ means changing the output. Measured on the same machine (1.0.1):
 
 ## API principles
 
-- **The library creates every object, the caller holds handles.** `sm_model`, `sm_ctx`, `sm_request`, `sm_motion`,
-  `sm_text`, each with `_create` and `_free`. Struct layouts are not part of the ABI.
-- **Parameters are numbered and set one at a time** (`sm_request_set_int(r, SM_P_STEPS, 10)`), as zstd does. Each has a
-  default and a range from the model file. A new parameter is a new number, so old binaries keep working.
-- **The API describes itself.** Parameters have stable snake_case names (`sm_request_set_by_name(r, "steps", "10")`),
-  and `sm_api_schema_json()` lists every parameter, input and output with its type, unit and range, for bindings, UIs and
-  config files.
-- **One public struct**, `sm_hooks` (allocator, logger, threads). It starts with its own size and only grows at the end.
-- **A model is immutable and shared.** One context per thread, any number per model. Only `sm_ctx_cancel` may be called
-  from another thread. No global state.
-- **No allocation in steady state.** Results go into a reusable `sm_motion` that grows once. After a reserve call (or the
-  first call of a size), generation allocates nothing. Getters return borrowed pointers, which in WebAssembly are
-  zero-copy views into the heap.
-- **Errors are a status plus a message.** Negative statuses are errors and never reused. The context or request keeps a
-  message that names the rejected value and its range. Load errors go into a caller buffer.
-- **Edits say what the user means.** A prefix to continue a clip, `SM_P_LOOP` for a cycle, kept blocks on a timeline,
-  pinned codes in the same layout `sm_motion_codes` returns. The 2-frames-per-token detail stays inside the library.
-- **The ABI only grows.** Exported symbols are exactly the `SM_API` declarations of `sm.h` (`make test` checks it).
-  Functions, parameters, info keys and statuses are only appended within major version 1.
+- **Values with fields.** `sm_model`, `sm_motion` and `sm_text` are small structs returned by value; their fields are
+  the data (`motion.joints`, `model.fps`) and one `internal` pointer holds the rest. Load and unload pairs free them.
+- **A simple call and an `_ex` call.** `sm_generate_motion(model, prompt, seconds, seed)` takes plain arguments;
+  `sm_generate_motion_ex` takes an `sm_options` struct that `sm_default_options` fills from the model file. Every
+  setting is a named field with its range in the header, and options are values: copy one, change a field.
+- **No status codes.** A failed call returns an empty value and `sm_get_error()` says why, per thread, naming the
+  rejected field and its range ("seconds = 12.5 is out of range 0.5 .. 10"). A call given an empty value fails with the
+  error that made it, so a chain of calls can be checked once at the end.
+- **A model is shared.** Any number of threads may call with one model at once. Each call borrows scratch memory from a
+  few contexts the model keeps, so scratch is reused without the caller holding any.
+- **Process settings are functions.** `sm_set_memory_functions`, `sm_set_thread_count` and `sm_set_parallel_for` apply
+  to models loaded after them.
+- **Edits say what the user means.** `previous` continues a motion, `loop` makes a cycle, `kept_codes` keep blocks on a
+  timeline, pinned codes use the layout of `motion.codes`. The 2-frames-per-token detail stays inside the library.
+- **The ABI only grows.** Exported symbols are exactly the `SM_API` declarations of `sprongmotion.h` (`make test`
+  checks it). Within major version 1 functions are only added and structs only grow at the end. In WebAssembly a struct
+  is passed and returned through memory (a pointer to it, the result's pointer first); `examples/05_wasm.mjs` shows the
+  layout.

@@ -63,8 +63,11 @@ static void test_golden(const char *path, const float *rest) {
 
 int main(int argc, char **argv) {
     test_quat();
-    sm_model *m = NULL; CHECK(sm_model_load_file("tests/data/test.gguf", NULL, &m, NULL, 0) == SM_OK); if (!m) return CHECK_DONE();
+    sm_model model = sm_load_model("tests/data/test.gguf");
+    const sm_model_impl *m = model.internal;
+    CHECK(m != NULL);
+    if (!m) return CHECK_DONE();
     test_golden(argc > 1 ? argv[1] : "tests/data/motion_golden.bin", m->rest);
-    sm_model_free(m);
+    sm_unload_model(model);
     return CHECK_DONE();
 }

@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
-#include "sm.h"
+#include "sprongmotion.h"
 
 static double now(void) {
     struct timespec t;
@@ -13,71 +13,87 @@ static double now(void) {
 static double best(double a, double b) { return b < a ? b : a; }
 
 typedef struct { double text, base, res, decode, total; } phases;
+typedef struct { double last, base, res; int steps; } pass_times;
 
-static phases clip(sm_ctx *c, sm_request *r, sm_motion *mo, double seconds, int runs) {
+static bool on_pass(void *user, int done, int total) {
+    (void)total;
+    pass_times *p = user;
+    const double t = now();
+    *(done <= p->steps ? &p->base : &p->res) += t - p->last;
+    p->last = t;
+    return true;
+}
+
+static phases clip(sm_model model, const char *prompt, float seconds, int runs) {
     phases b = {1e9, 1e9, 1e9, 1e9, 1e9};
-    int32_t steps, res;
-    sm_request_set_float(r, SM_P_SECONDS, seconds);
-    sm_request_get_int(r, SM_P_STEPS, &steps);
-    sm_request_get_int(r, SM_P_RES_LAYERS, &res);
+    sm_options options = sm_default_options(model);
+    options.seconds = seconds;
+    options.progress = on_pass;
     for (int i = 0; i < runs; i++) {
-        phases p = {0};
-        double t0 = now(), t = t0;
-        sm_status s = sm_ctx_begin(c, r, &mo, 1);
-        p.text = now() - t;
-        for (uint32_t pass = 0; s == SM_OK; pass++) {
-            t = now();
-            s = sm_ctx_step(c, NULL, NULL);
-            *(pass < (uint32_t)steps ? &p.base : &p.res) += now() - t;
+        pass_times p = {0, 0, 0, options.steps};
+        const double t0 = now();
+        sm_text text = sm_encode_text(model, prompt);
+        options.text = &text;
+        options.user = &p;
+        p.last = now();
+        const double text_ms = p.last - t0;
+        sm_motion motion = sm_generate_motion_ex(model, NULL, options);
+        const double end = now();
+        if (!sm_is_motion_valid(motion)) {
+            puts(sm_get_error());
+            exit(1);
         }
-        t = now();
-        if (s != SM_DONE || sm_ctx_finish(c) != SM_OK) exit((puts(sm_ctx_last_error(c)), 1));
-        p.decode = now() - t, p.total = now() - t0;
-        b = (phases){best(b.text, p.text), best(b.base, p.base / steps), best(b.res, res ? p.res / res : 0),
-                     best(b.decode, p.decode), best(b.total, p.total)};
+        sm_unload_motion(motion);
+        sm_unload_text(text);
+        const int res = options.residual_layers;
+        const phases run = {text_ms, p.base / options.steps, res ? p.res / res : 0, end - p.last, end - t0};
+        b = (phases){best(b.text, run.text), best(b.base, run.base), best(b.res, run.res),
+                     best(b.decode, run.decode), best(b.total, run.total)};
     }
     return b;
 }
 
-int main(int argc, char **argv) {
-    if (argc < 2) return fprintf(stderr, "usage: %s model.gguf [threads] [runs]\n", argv[0]), 2;
-    sm_hooks h = SM_HOOKS_INIT;
-    h.n_threads = argc > 2 ? (uint32_t)atoi(argv[2]) : 0;
-    const int runs = argc > 3 ? atoi(argv[3]) : 10;
-    char err[256];
-    sm_model *m;
-    if (sm_model_load_file(argv[1], &h, &m, err, sizeof err) != SM_OK) return fprintf(stderr, "%s\n", err), 1;
-    sm_ctx *c;
-    sm_request *r;
-    sm_motion *mo;
-    sm_ctx_create(m, &c);
-    sm_request_create(m, &r);
-    sm_motion_create(m, &mo);
-    sm_ctx_reserve(c, 10, 1);
-    sm_motion_reserve(mo, 12);
-    sm_request_set_text(r, "a person walks forward and waves with the left hand", -1);
-    printf("%s, %u threads, best of %d (ms)\n", sm_build_info(), h.n_threads, runs);
-    const char *texts[6] = {"a person walks forward", "a person waves", "a person jumps", "a person turns left",
-                            "a person kneels down", "a person stands up and stretches"};
-    const double secs[6] = {2, 2, 2, 2, 2, 2};
-    const int32_t seeds[6] = {1, 2, 3, 4, 5, 6};
-    double tl = 1e9;
+static double timeline(sm_model model, int runs) {
+    const sm_block blocks[6] = {
+        {"a person walks forward", NULL, 2, 1, NULL}, {"a person waves", NULL, 2, 2, NULL},
+        {"a person jumps", NULL, 2, 3, NULL}, {"a person turns left", NULL, 2, 4, NULL},
+        {"a person kneels down", NULL, 2, 5, NULL}, {"a person stands up and stretches", NULL, 2, 6, NULL},
+    };
+    double fastest = 1e9;
     for (int i = 0; i < runs; i++) {
         const double t = now();
-        if (sm_ctx_generate_blocks(c, r, 6, texts, NULL, secs, seeds, NULL, NULL, mo) != SM_OK)
-            return puts(sm_ctx_last_error(c)), 1;
-        tl = best(tl, now() - t);
+        sm_motion motion = sm_generate_timeline(model, blocks, 6, sm_default_options(model));
+        fastest = best(fastest, now() - t);
+        if (!sm_is_motion_valid(motion)) {
+            puts(sm_get_error());
+            exit(1);
+        }
+        sm_unload_motion(motion);
     }
+    return fastest;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s model.gguf [threads] [runs]\n", argv[0]);
+        return 2;
+    }
+    const int threads = argc > 2 ? atoi(argv[2]) : 0, runs = argc > 3 ? atoi(argv[3]) : 10;
+    sm_set_thread_count(threads);
+    sm_model model = sm_load_model(argv[1]);
+    if (!sm_is_model_valid(model)) {
+        fprintf(stderr, "%s\n", sm_get_error());
+        return 1;
+    }
+    printf("%s, %d threads, best of %d (ms)\n", sm_get_build_info(), threads, runs);
+    const double tl = timeline(model, runs);
     printf("timeline 6 x 2 s   %7.1f total  %6.1f per block\n", tl, tl / 6);
     printf("clip    text  base/step  res/layer  decode   total\n");
-    const double len[3] = {2, 5, 10};
+    const float len[3] = {2, 5, 10};
     for (int i = 0; i < 3; i++) {
-        const phases p = clip(c, r, mo, len[i], runs);
+        const phases p = clip(model, "a person walks forward and waves with the left hand", len[i], runs);
         printf("%4.0f s %6.2f %10.2f %10.2f %7.2f %7.1f\n", len[i], p.text, p.base, p.res, p.decode, p.total);
     }
-    sm_motion_free(mo);
-    sm_request_free(r);
-    sm_ctx_free(c);
-    sm_model_free(m);
+    sm_unload_model(model);
     return 0;
 }

@@ -6,7 +6,40 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
-#include "../include/sm.h"
+#include "../include/sprongmotion.h"
+
+typedef int32_t sm_status;   /* negative: an error */
+enum {
+    SM_OK = 0, SM_DONE = 1, SM_E_ARG = -1, SM_E_FORMAT = -2, SM_E_VERSION = -3, SM_E_CHECKSUM = -4, SM_E_NOMEM = -5,
+    SM_E_CANCELLED = -7, SM_E_NUMERIC = -8, SM_E_UNSUPPORTED = -9, SM_E_IO = -10, SM_E_STATE = -11
+};
+const char *sm_status_message(sm_status s);
+void        sm_set_error(const char *msg);   /* this thread's sm_get_error */
+int         sm_check_input(const void *internal, const char *msg);   /* 0 for an empty input */
+
+enum {
+    SM_P_SECONDS = 1, SM_P_SEED, SM_P_STEPS, SM_P_RES_LAYERS, SM_P_CFG, SM_P_RES_CFG, SM_P_TEMP, SM_P_TOP_K,
+    SM_P_FOOT_LOCK, SM_P_IN_PLACE, SM_P_LOOP, SM_P_PATH_WARP = 13
+};
+
+typedef struct sm_model_impl sm_model_impl;
+typedef struct sm_motion_impl sm_motion_impl;
+typedef struct sm_text_impl sm_text_impl;
+typedef struct sm_ctx sm_ctx;
+typedef struct sm_request sm_request;
+typedef void (*sm_job_fn)(void *arg, uint32_t index);
+
+/* the settings a model takes at load */
+typedef struct {
+    void *(*alloc)(size_t size, size_t align);
+    void (*free)(void *ptr);
+    void (*parallel_for)(void *user, int n, sm_task_fn task, void *arg);
+    void *user;
+    uint32_t n_threads;
+} sm_hooks;
+const sm_hooks *sm_settings(void);
+#define SM_LOAD_BORROW  1u   /* use the bytes in place */
+#define SM_LOAD_NOCHECK 2u   /* skip the checksum */
 
 enum { SM_J = 22, SM_F = 263, SM_VQ_W = 256, SM_VQ_N = 512, SM_VQ_LAYERS = 6, SM_N_PARAMS = 14 };
 enum {
@@ -70,10 +103,10 @@ size_t  sm_tok_unknown(const sm_tok *t, const sm_tok_work *w, const int32_t *ids
                        uint32_t *count);
 
 /* run(user, n, fn, arg) calls fn(arg, i) for every i < n and returns when all are done */
-typedef struct { void (*run)(void *user, uint32_t n, sm_task_fn fn, void *arg); void *user; } sm_par;
-void  sm_par_for(const sm_par *p, uint32_t n, sm_task_fn fn, void *arg);   /* p NULL: in order on this thread */
+typedef struct { void (*run)(void *user, uint32_t n, sm_job_fn fn, void *arg); void *user; } sm_par;
+void  sm_par_for(const sm_par *p, uint32_t n, sm_job_fn fn, void *arg);   /* p NULL: in order on this thread */
 void *sm_pool_create(const sm_hooks *h, uint32_t threads);                  /* 0: the core count; NULL: one thread */
-void  sm_pool_run(void *pool, uint32_t n, sm_task_fn fn, void *arg);
+void  sm_pool_run(void *pool, uint32_t n, sm_job_fn fn, void *arg);
 void  sm_pool_free(const sm_hooks *h, void *pool);
 
 /* e^x = 2^n e^r, |r| <= ln2 / 2 (Cody-Waite: n ln2_hi is exact), Taylor to r^7: the same bits on every target */
@@ -189,22 +222,31 @@ double   sm_log(double x);
 float    sm_round_half(float x);   /* to the nearest float16 and back, ties to even */
 
 #define SM_MAX_META 32
-struct sm_model {
-    sm_hooks h; uint8_t *own; const void *map; size_t map_size;
+typedef struct sm_spare_ctxs sm_spare_ctxs;
+struct sm_model_impl {
+    sm_hooks h; uint8_t *own; const void *map; size_t map_size; sm_spare_ctxs *spares;
     sm_gguf g; sm_tensor *tensors; sm_tok tok; void *tok_table; sm_vq vq; sm_textenc text; sm_gen gen;
     sm_par par; void *pool; float *packed;
     const float *rest;              /* [22][3] the reference skeleton */
     double param[SM_N_PARAMS][3];   /* min, max, default */
-    uint32_t fps, frames_per_token, max_frames, crc; int32_t params_k;
-    char *meta_mem, id[96], *schema; const char *meta[2 * SM_MAX_META]; uint32_t n_meta;
+    uint32_t fps, frames_per_token, max_frames, crc;
+    int parents[SM_J];
+    char *meta_mem, id[96]; const char *meta[2 * SM_MAX_META]; uint32_t n_meta;
     const char **vocab; uint32_t n_vocab;
 };
 void       *sm_alloc(const sm_hooks *h, size_t size);
-void        sm_free(const sm_hooks *h, void *p);
-const void *sm_need(const sm_model *m, const char *name, uint32_t type, uint32_t nd, uint64_t *dims, char *err,
+void        sm_dealloc(const sm_hooks *h, void *p);
+const void *sm_need(const sm_model_impl *m, const char *name, uint32_t type, uint32_t nd, uint64_t *dims, char *err,
                     size_t err_len);
-sm_status   sm_bind_gen(sm_model *m, char *err, size_t err_len);   /* a file without text.* has no generator */
-sm_status   sm_bind_params(sm_model *m, char *err, size_t err_len);
+sm_status   sm_load(const void *bytes, size_t size, uint32_t flags, sm_model_impl **out, char *err, size_t err_len);
+void        sm_unload(sm_model_impl *m);
+sm_status   sm_bind_all(sm_model_impl *m, uint32_t flags, char *err, size_t err_len);
+const char *sm_meta(const sm_model_impl *m, const char *key);
+FILE       *sm_open_file(const char *path, const char *mode);   /* UTF-8 paths on Windows too */
+sm_ctx     *sm_borrow_ctx(const sm_model_impl *m);   /* a context for one call, from the model's spares */
+void        sm_return_ctx(sm_ctx *c);
+sm_status   sm_bind_gen(sm_model_impl *m, char *err, size_t err_len);   /* a file without text.* has no generator */
+sm_status   sm_bind_params(sm_model_impl *m, char *err, size_t err_len);
 
 /* poses in double */
 typedef struct { double w, x, y, z; } sm_quat;
@@ -212,6 +254,7 @@ sm_quat sm_qmul(sm_quat a, sm_quat b);
 void    sm_qrot(sm_quat q, const double v[3], double out[3]);
 sm_quat sm_qbetween(const double u[3], const double v[3]);  /* unit u, v */
 extern const int8_t sm_parent[SM_J];
+extern const char *const sm_joint_names[SM_J];
 typedef struct { double yaw, x, z; float vel[3]; int32_t moving; } sm_track;   /* the root after a clip; zero: start */
 void sm_features_to_joints(const float *feat, uint32_t T, sm_track *tr, float *joints);   /* recover_from_ric */
 void sm_rotations(const float *joints, uint32_t T, const float *rest, float *xyzw);   /* [T][22][4], parent-relative */
@@ -227,7 +270,7 @@ void   sm_joints_to_features(const float *joints, uint32_t T, double *tmp, float
 /* points [n][4]: t, x, z, heading */
 #define SM_MAX_PATH 1024
 typedef struct { float p[SM_MAX_PATH * 4]; uint32_t n; } sm_path;
-sm_status sm_path_check(const sm_model *m, const sm_path *p, uint32_t tokens, char *err, size_t err_len);
+sm_status sm_path_check(const sm_model_impl *m, const sm_path *p, uint32_t tokens, char *err, size_t err_len);
 /* the root xz smoothed (g [T][2]) and its speed */
 void   sm_root_smooth(const float *joints, uint32_t T, double fps, double *g, float *speed);
 /* with warp, the root onto the path and every joint turned with it. Returns the largest distance of g from the
@@ -242,59 +285,61 @@ double sm_path_warp(const sm_path *p, float *joints, uint32_t T, double fps, con
 #define SM_MAX_CODES  6000 /* tokens of one decode: 10 minutes */
 #define SM_MAX_PINS   512  /* tokens of pinned codes in a request */
 typedef struct { int16_t codes[SM_CONTEXT * SM_VQ_LAYERS]; uint32_t n; sm_track track; float last[SM_F]; } sm_prefix;
-struct sm_text { const sm_model *m; float *vec, *words; uint32_t W, ready, n_unknown; char unknown[1024]; };
+struct sm_text_impl { const sm_model_impl *m; float *vec, *words; uint32_t W, ready, n_unknown; char unknown[1024]; };
 struct sm_request {   /* has_text 1: text, 2: enc */
-    const sm_model *m; double v[SM_N_PARAMS]; sm_prefix pre; sm_text *enc; sm_path path;
+    const sm_model_impl *m; double v[SM_N_PARAMS]; sm_prefix pre; const sm_text_impl *enc; sm_path path;
     uint32_t has_text, text_len, n_pins; char text[SM_MAX_TEXT + 1], err[128]; int16_t pins[SM_MAX_PINS * SM_VQ_LAYERS];
 };
-struct sm_motion {   /* mem holds feat .. contacts */
-    const sm_model *m; uint32_t cap, tokens, frames; int32_t seed; sm_track end; void *mem; float path_err;
+struct sm_motion_impl {   /* mem holds feat .. contacts */
+    const sm_model_impl *m; uint32_t cap, tokens, frames; int32_t seed; sm_track end; void *mem; float path_err;
     float *feat, *joints, *rot, *root, *speed, *conf, off[SM_J * 3]; int16_t *codes; uint8_t *contacts;
+    int *block_starts; uint32_t n_blocks;   /* a timeline's */
 };
-#define SM_MAX_VARIANTS 16
 #define SM_MAX_RUN 512   /* tokens per run */
 #define SM_TIE 12        /* tokens a loop makes past its end as its start again, then drops */
 #define SM_WRAP 16       /* tokens of a loop's decode window past each end: more than the decoder's reach (15) */
-#define SM_ACTIVE "a run is active: finish or abort it first"
-#define SM_CANCELLED_MSG "cancel is set: call sm_ctx_clear_cancel"
 struct sm_ctx {
-    const sm_model *m;
-    _Atomic int cancel;
-    sm_progress_fn progress;
-    void *user;
+    const sm_model_impl *m;
+    const sm_options *options;             /* the call's progress callback */
     void *scratch, *dec;                   /* text encoder or generator; decoder */
     size_t n_scratch, n_dec;               /* bytes */
     sm_tok_work *tw;
-    sm_text *text;
-    int active;
-    uint32_t n, at, L, fresh, skip, tie;   /* variants, the one running, tokens made, kept, the prefix's, the wrap's */
-    double v[SM_N_PARAMS];
-    sm_prefix pre;
-    sm_path path;
+    sm_text_impl *text;
+    uint32_t L, fresh, skip, tie;          /* tokens made, kept, the prefix's, the wrap's */
     sm_run run;
-    sm_motion *outs[SM_MAX_VARIANTS];
+    char err[128];
+    sm_request req;
     int16_t codes[SM_MAX_RUN * SM_VQ_LAYERS];
     float conf[SM_MAX_RUN];
     int16_t pins[SM_MAX_RUN * SM_VQ_LAYERS];
-    char err[128];
 };
+sm_status sm_ctx_create(const sm_model_impl *m, sm_ctx **out);
+void      sm_ctx_free(sm_ctx *c);
 sm_status sm_ctx_fail(sm_ctx *c, sm_status s, const char *msg);
 sm_status sm_ctx_fail_range(sm_ctx *c, const char *name, double v, double lo, double hi);
 sm_status sm_ctx_fit(sm_ctx *c, uint32_t L, uint32_t Lw);   /* room for generating L tokens and decoding Lw */
-uint32_t  sm_tokens_of(const sm_model *m, double seconds);
-sm_status sm_ctx_encode(sm_ctx *c, const char *utf8, size_t len, sm_text *t);
+uint32_t  sm_tokens_of(const sm_model_impl *m, double seconds);
+sm_status sm_ctx_encode(sm_ctx *c, const char *utf8, size_t len, sm_text_impl *t);
 sm_status sm_ctx_decode(sm_ctx *c, const int16_t *codes, uint32_t n, const sm_prefix *pre, const double *v,
-                        const sm_path *path, sm_motion *mo);
+                        const sm_path *path, sm_motion_impl *mo);
 sm_status sm_ctx_start_run(sm_ctx *c, const double *v, uint32_t L, uint32_t tie, int32_t seed);
-sm_status sm_ctx_next_pass(sm_ctx *c);   /* SM_E_CANCELLED once cancel is set */
 sm_status sm_ctx_report(sm_ctx *c, uint32_t done, uint32_t total);   /* SM_E_CANCELLED if the callback says stop */
-void      sm_param_defaults(const sm_model *m, double *v);
-sm_status sm_check_text(const char *utf8, int32_t len, size_t *n, char *err, size_t err_len);
-void      sm_text_copy(sm_text *dst, const sm_text *src);
-size_t    sm_schema(const sm_model *m, char *buf, size_t cap);
-sm_status sm_motion_fit(sm_motion *mo, uint32_t tokens);
+typedef sm_status (*sm_maker)(sm_ctx *c, const void *args, sm_motion_impl *out);
+sm_motion sm_make_motion(sm_model model, const char *prompt, const sm_options *o, sm_maker make, const void *args);
+void      sm_param_defaults(const sm_model_impl *m, double *v);
+sm_status sm_check_text(const char *utf8, size_t *n, char *err, size_t err_len);
+/* the request from options; prompt and options->text may both be NULL (decoding) */
+sm_status sm_fill_request(sm_request *r, const sm_model_impl *m, const char *prompt, const sm_options *o);
+sm_status sm_set_path(sm_request *r, const float *points, int count);
+sm_status sm_text_create(const sm_model_impl *m, sm_text_impl **out);
+void      sm_text_free(sm_text_impl *t);
+void      sm_text_copy(sm_text_impl *dst, const sm_text_impl *src);
+sm_status sm_motion_create(const sm_model_impl *m, sm_motion_impl **out);
+void      sm_motion_free(sm_motion_impl *mo);
+sm_status sm_motion_fit(sm_motion_impl *mo, uint32_t tokens);
+sm_motion sm_wrap_motion(sm_motion_impl *mo);   /* the public view; NULL: an empty motion */
 /* everything else from mo->feat; v: the parameters, path may be NULL, tmp: SM_POST_TMP(T) */
-void      sm_motion_post(sm_motion *mo, const sm_track *tr, const double *v, const sm_path *path, double *tmp);
+void      sm_motion_post(sm_motion_impl *mo, const sm_track *tr, const double *v, const sm_path *path, double *tmp);
 typedef struct { char *p; size_t cap, n; } sm_buf;   /* writes while it fits, counts always */
 void      sm_puts(sm_buf *b, const char *s);
 void      sm_putn(sm_buf *b, double v);   /* C locale, at most 6 decimals */

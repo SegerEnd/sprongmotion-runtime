@@ -14,13 +14,13 @@ static const golden *find(const char *fmt, int i, int j) {
     return find_golden(name);
 }
 
-static sm_model *load_model(const char *var, uint32_t threads) {
-    const char *path = getenv(var); char err[128]; sm_model *m = NULL;
-    sm_hooks h = SM_HOOKS_INIT; h.n_threads = threads;
+static sm_model_impl *load_model(const char *var, uint32_t threads) {
+    const char *path = getenv(var);
     if (!path) return NULL;
-    if (sm_model_load_file(path, &h, &m, err, sizeof err) == SM_OK) return m;
-    fprintf(stderr, "%s: %s\n", path, err);
-    return NULL;
+    sm_set_thread_count((int)threads);
+    const sm_model m = sm_load_model(path);
+    if (!sm_is_model_valid(m)) fprintf(stderr, "%s: %s\n", path, sm_get_error());
+    return m.internal;
 }
 
 static int32_t *ids_of(int p, uint32_t *W) {
@@ -83,7 +83,7 @@ static void test_noise(void) {
 }
 
 /* per pass: text encoder, base pass (all masked) and residual passes 1 and 5, all with torch's inputs */
-static void test_passes(const sm_model *m) {
+static void test_passes(const sm_model_impl *m) {
     const sm_gen *g = &m->gen; const sm_sampling s = sampling();
     float *ts = malloc(sizeof(float) * sm_text_scratch_floats(&m->text)), vec[512], row[1024];
     float *words = malloc(sizeof(float) * 40 * 256), *hist = malloc(sizeof(float) * 100 * g->d);
@@ -207,7 +207,7 @@ static const float *want_codes(int c, uint32_t *L) {   /* clip c: prompt c / 12,
 #endif
 
 /* every clip of at most max_l tokens end to end (text encoder included), into out */
-static void generate_all(const sm_model *m, clip *out, uint32_t max_l, float *vecs, float *words) {
+static void generate_all(const sm_model_impl *m, clip *out, uint32_t max_l, float *vecs, float *words) {
     const sm_sampling s = sampling(); const sm_gen *g = &m->gen;
     float *ts = malloc(sizeof(float) * sm_text_scratch_floats(&m->text));
     float *gs = malloc(sizeof(float) * sm_gen_scratch_floats(g, 40, 100));
@@ -223,7 +223,7 @@ static void generate_all(const sm_model *m, clip *out, uint32_t max_l, float *ve
 }
 
 /* end to end: the F32 file vs torch's codes; the margin at the first flip of each clip that differs */
-static void test_end_to_end(const sm_model *m, clip *got) {
+static void test_end_to_end(const sm_model_impl *m, clip *got) {
     const sm_sampling s = sampling(); float *vecs = malloc(sizeof(float) * N_PROMPTS * 512);
     float *words = malloc(sizeof(float) * N_PROMPTS * 40 * 256);
     float *gs = malloc(sizeof(float) * sm_gen_scratch_floats(&m->gen, 40, 100));
@@ -247,7 +247,7 @@ static void test_end_to_end(const sm_model *m, clip *got) {
 }
 
 /* Q8_0 vs F32 in C, the same prompts and seeds, clips up to 49 tokens */
-static void test_q8(const sm_model *q8, const clip *f32) {
+static void test_q8(const sm_model_impl *q8, const clip *f32) {
     const uint32_t max_l = MAX_L < 49 ? MAX_L : 49;
     clip *got = malloc(sizeof(clip) * N_CLIPS); float *vecs = malloc(sizeof(float) * N_PROMPTS * 512);
     float *words = malloc(sizeof(float) * N_PROMPTS * 40 * 256);
@@ -271,7 +271,7 @@ static void test_q8(const sm_model *q8, const clip *f32) {
 static double now(void) { struct timespec t; timespec_get(&t, TIME_UTC); return (double)t.tv_sec + (double)t.tv_nsec * 1e-9; }
 
 /* the codes of prompt 0 at L tokens, seed 0; the best wall time of reps runs, in ms */
-static double run_clip(const sm_model *m, uint32_t L, int reps, int16_t *codes) {
+static double run_clip(const sm_model_impl *m, uint32_t L, int reps, int16_t *codes) {
     const sm_sampling s = sampling(); uint32_t W; int32_t *ids = ids_of(0, &W); float vec[512], words[40 * 256];
     float *ts = malloc(sizeof(float) * sm_text_scratch_floats(&m->text));
     float *gs = malloc(sizeof(float) * sm_gen_scratch_floats(&m->gen, W, L)); double best = INFINITY;
@@ -291,14 +291,14 @@ static void test_threads(int speed) {
     for (int f = 0; f < 2; f++) {
         int16_t want[600], got[600]; int same = 1;
         for (int t = 0; t < 3; t++) {
-            sm_model *m = load_model(files[f], threads[t]);
+            sm_model_impl *m = load_model(files[f], threads[t]);
             if (!m) return;
             run_clip(m, MAX_L < 49 ? MAX_L : 49, 1, t ? got : want);
             same &= !t || !memcmp(got, want, sizeof(int16_t) * 6 * (MAX_L < 49 ? MAX_L : 49));
             for (uint32_t L = 50; speed && f == 0 && t != 1 && L <= 100; L += 50)
                 printf("speed (Q8_0, %u thread%s): %.0f ms per %u s clip\n", threads[t], t ? "s" : "",
                        run_clip(m, L, 3, got), L / 10);
-            sm_model_free(m);
+            sm_unload(m);
         }
         printf("%s: the same codes at 1, 2 and 4 threads: %s\n", files[f], same ? "yes" : "no");
         CHECK(same);
@@ -308,12 +308,12 @@ static void test_threads(int speed) {
 int main(void) {
     CHECK(load_goldens("tests/data/gen_golden.bin")); if (!n_goldens) return CHECK_DONE();
     test_noise();
-    sm_model *f32 = load_model("SM_GOLDEN_F32", 0), *q8 = load_model("SM_GOLDEN_Q8", 0);
+    sm_model_impl *f32 = load_model("SM_GOLDEN_F32", 0), *q8 = load_model("SM_GOLDEN_Q8", 0);
     if (!f32 || !q8) printf("test_gen: no $SM_GOLDEN_F32 and $SM_GOLDEN_Q8, generator tests skipped\n");
     clip *codes = malloc(sizeof(clip) * N_CLIPS);
     if (f32) { test_passes(f32); test_end_to_end(f32, codes); }
     if (f32 && q8) test_q8(q8, (const clip *)codes);
-    sm_model_free(f32); sm_model_free(q8); free(codes);
+    sm_unload(f32); sm_unload(q8); free(codes);
     if (f32 && q8) test_threads(MAX_L == 100);
     free_goldens();
     return CHECK_DONE();

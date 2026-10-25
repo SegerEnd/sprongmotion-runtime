@@ -1,74 +1,92 @@
-/* Change a motion without starting over: regenerate a range, make a loop, edit one block of a timeline, and
+/* Change a motion without starting over: make a range again, make a loop, make one block of a timeline again, and
    (with a model file that has the motion encoder) continue motion that came from elsewhere. Usage: 04_edit model.gguf */
 #include <stdio.h>
 #include <string.h>
-#include "sm.h"
+#include "sprongmotion.h"
 
-static int failed(sm_status s, sm_ctx *c) { return s != SM_OK && fprintf(stderr, "%s\n", sm_ctx_last_error(c)); }
+#define TOKENS 50   /* 5 s: 2 frames per token, 6 codes per token */
 
-static int run(sm_model *m, sm_ctx *c, sm_request *r, sm_motion *a, sm_motion *b) {
-    int16_t codes[50 * 6];
-    sm_request_set_text(r, "a person walks forward", -1);
-    sm_request_set_float(r, SM_P_SECONDS, 5);
-    if (failed(sm_ctx_generate(c, r, &a, 1), c)) return 1;
-    memcpy(codes, sm_motion_codes(a, NULL), sizeof codes);   /* 50 tokens (2 frames each), 6 codes per token */
-    for (int t = 20; t < 30; t++) codes[6 * t] = -1;          /* 2 s to make again, the rest stays */
-    sm_request_set_text(r, "a person jumps up and down", -1);
-    sm_request_set_codes(r, codes, 50);
-    if (failed(sm_ctx_generate(c, r, &b, 1), c)) return 1;
-    printf("walk, a jump in the middle: %u frames, the first 2 s unchanged: %s\n", sm_motion_frames(b),
-           memcmp(sm_motion_codes(b, NULL), codes, 20 * 6 * sizeof(int16_t)) ? "no" : "yes");
+static bool made(sm_motion motion) {
+    if (!sm_is_motion_valid(motion)) fprintf(stderr, "%s\n", sm_get_error());
+    return sm_is_motion_valid(motion);
+}
 
-    sm_request_set_codes(r, NULL, 0);
-    sm_request_set_text(r, "a person runs forward", -1);
-    sm_request_set_float(r, SM_P_SECONDS, 2);
-    sm_request_set_int(r, SM_P_LOOP, 1);   /* the end leads into the start: play it on repeat */
-    if (failed(sm_ctx_generate(c, r, &a, 1), c)) return 1;
-    printf("run cycle: %u frames\n", sm_motion_frames(a));
-    sm_request_set_int(r, SM_P_LOOP, 0);
+static bool made_model(sm_model model) {
+    if (!sm_is_model_valid(model)) fprintf(stderr, "%s\n", sm_get_error());
+    return sm_is_model_valid(model);
+}
 
-    const char *texts[3] = {"a person walks forward", "a person waves", "a person sits down"};
-    const double seconds[3] = {3, 2, 3};
-    int32_t seeds[3] = {1, 2, 3};
-    uint32_t first[4];
-    if (failed(sm_ctx_generate_blocks(c, r, 3, texts, NULL, seconds, seeds, NULL, first, a), c)) return 1;
-    const int16_t *all = sm_motion_codes(a, NULL);
-    const int16_t *keep[3] = {all + first[0] / 2 * 6, NULL, all + first[2] / 2 * 6};   /* keep blocks 0 and 2 */
-    seeds[1] = 9;                                                                        /* another wave */
-    if (failed(sm_ctx_generate_blocks(c, r, 3, texts, NULL, seconds, seeds, keep, first, b), c)) return 1;
-    printf("timeline: blocks at frames %u, %u, %u of %u; the wave made again between the kept blocks\n", first[0],
-           first[1], first[2], first[3]);
+static bool remake_range(sm_model model, sm_options options) {
+    int16_t codes[TOKENS * 6];
+    options.seconds = 5;
+    sm_motion walk = sm_generate_motion_ex(model, "a person walks forward", options);
+    if (!made(walk)) return false;
+    memcpy(codes, walk.codes, sizeof codes);
+    sm_unload_motion(walk);
 
-    if (!sm_model_info(m, SM_I_ENCODER)) return 0;
-    uint32_t n;   /* joints from anywhere (here the timeline's), turned into codes, then continued */
-    const float *joints = sm_motion_joints(b, &n);
-    if (failed(sm_ctx_encode_motion(c, r, joints, n / 66, a), c)) return 1;
-    sm_request_set_prefix(r, a);
-    sm_request_set_text(r, "a person stands up and walks away", -1);
-    sm_request_set_float(r, SM_P_SECONDS, 3);
-    if (failed(sm_ctx_generate(c, r, &b, 1), c)) return 1;
-    printf("encoded %u frames into %u tokens, then went on for %u frames\n", n / 66, sm_motion_frames(a) / 2,
-           sm_motion_frames(b));
-    return 0;
+    for (int t = 20; t < 30; t++) codes[6 * t] = -1;   /* 2 s to make again, the rest stays */
+    options.pinned_codes = codes;
+    options.pinned_token_count = TOKENS;
+    sm_motion jump = sm_generate_motion_ex(model, "a person jumps up and down", options);
+    if (!made(jump)) return false;
+    const bool kept = !memcmp(jump.codes, codes, 20 * 6 * sizeof(int16_t));
+    printf("walk, a jump in the middle: %d frames, the first 2 s unchanged: %s\n", jump.frame_count, kept ? "yes" : "no");
+    sm_unload_motion(jump);
+    return true;
+}
+
+static bool make_loop(sm_model model, sm_options options) {
+    options.seconds = 2;
+    options.loop = true;   /* the end leads into the start: play it on repeat */
+    sm_motion run = sm_generate_motion_ex(model, "a person runs forward", options);
+    if (!made(run)) return false;
+    printf("run cycle: %d frames\n", run.frame_count);
+    sm_unload_motion(run);
+    return true;
+}
+
+/* the wave made again between the kept walk and sit, then the timeline's joints encoded and continued */
+static bool edit_timeline(sm_model model, sm_options options) {
+    sm_block blocks[3] = {
+        {"a person walks forward", NULL, 3, 1, NULL}, {"a person waves", NULL, 2, 2, NULL},
+        {"a person sits down", NULL, 3, 3, NULL},
+    };
+    sm_motion first = sm_generate_timeline(model, blocks, 3, options);
+    if (!made(first)) return false;
+    blocks[0].kept_codes = first.codes + first.block_start_frames[0] / 2 * 6;
+    blocks[2].kept_codes = first.codes + first.block_start_frames[2] / 2 * 6;
+    blocks[1].seed = 9;
+    sm_motion second = sm_generate_timeline(model, blocks, 3, options);
+    sm_unload_motion(first);
+    if (!made(second)) return false;
+    printf("timeline: blocks at frames %d, %d, %d of %d\n", second.block_start_frames[0], second.block_start_frames[1],
+           second.block_start_frames[2], second.block_start_frames[3]);
+
+    bool ok = true;
+    if (model.has_encoder) {
+        sm_motion encoded = sm_encode_motion(model, second.joints, second.frame_count, options);
+        options.previous = &encoded;
+        options.seconds = 3;
+        sm_motion next = sm_generate_motion_ex(model, "a person stands up and walks away", options);
+        ok = made(encoded) && made(next);
+        if (ok) printf("encoded %d frames into %d tokens, then went on for %d frames\n", second.frame_count,
+                       encoded.token_count, next.frame_count);
+        sm_unload_motion(next);
+        sm_unload_motion(encoded);
+    }
+    sm_unload_motion(second);
+    return ok;
 }
 
 int main(int argc, char **argv) {
-    char err[256];
-    sm_model *m;
-    if (argc != 2) return fprintf(stderr, "usage: %s model.gguf\n", argv[0]), 2;
-    if (sm_model_load_file(argv[1], NULL, &m, err, sizeof err) != SM_OK) return fprintf(stderr, "%s\n", err), 1;
-    sm_ctx *c;
-    sm_request *r;
-    sm_motion *a, *b;
-    sm_ctx_create(m, &c);
-    sm_request_create(m, &r);
-    sm_motion_create(m, &a);
-    sm_motion_create(m, &b);
-    const int bad = run(m, c, r, a, b);
-    sm_motion_free(a);
-    sm_motion_free(b);
-    sm_request_free(r);
-    sm_ctx_free(c);
-    sm_model_free(m);
-    return bad;
+    if (argc != 2) {
+        fprintf(stderr, "usage: %s model.gguf\n", argv[0]);
+        return 2;
+    }
+    sm_model model = sm_load_model(argv[1]);
+    const sm_options options = sm_default_options(model);
+    const bool ok = made_model(model) && remake_range(model, options) && make_loop(model, options) &&
+                    edit_timeline(model, options);
+    sm_unload_model(model);
+    return !ok;
 }
