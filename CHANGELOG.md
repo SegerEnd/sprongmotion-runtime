@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.0 (unreleased)
+## 1.1.0 (2026-10-26)
 
 A smaller public API in `include/sprongmotion.h` (it replaces `include/sm.h`): plain structs with fields, verb and noun
 names, load and unload pairs, an options struct for full control and one error string per thread. Output is
